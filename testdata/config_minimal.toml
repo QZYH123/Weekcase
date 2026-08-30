@@ -1,0 +1,17 @@
+# Extra keys must be ignored (forward compatible).
+future_schema = 99
+
+[general]
+start_with_windows = true
+
+[destination]
+downloads_template = "{root}/Downloads/{bucket}"
+screenshots_template = "{root}/Screenshots/{yyyy}-{mm}"
+collision = "suffix"
+
+[watch]
+max_pending = 256
+max_sources = 8
+buffer_bytes = 65536
+tick_ms = 1000
+debounce_ms = 500

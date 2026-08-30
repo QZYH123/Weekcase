@@ -7,6 +7,9 @@ description = "Windows 11 local archive helper for Downloads and Screenshots"
 publish = false
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.5.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
@@ -14,7 +17,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
 ] }
 
 [lints.clippy]

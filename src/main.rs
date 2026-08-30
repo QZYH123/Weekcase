@@ -1,12 +1,13 @@
 #![windows_subsystem = "windows"]
 
-mod log_init;
-mod paths;
-
 use std::io;
 use std::process::ExitCode;
 
-use paths::Paths;
+use weekcase::config;
+use weekcase::known_folders::KnownFolders;
+use weekcase::log_init;
+use weekcase::paths::Paths;
+use weekcase::state::AppState;
 
 const SINGLE_INSTANCE_MUTEX: &str = r"Local\Weekcase.SingleInstance";
 
@@ -27,12 +28,19 @@ fn run() -> io::Result<ExitCode> {
         None => return Ok(ExitCode::SUCCESS),
     };
     log_init::init(&paths)?;
+    let cfg = config::load_or_default(&paths.config_file())?;
+    let state = AppState::load(&paths.state_file())?;
+    let folders = KnownFolders::resolve();
     tracing::info!(
         config = %paths.config_file().display(),
         state = %paths.state_file().display(),
         undo = %paths.undo_file().display(),
         log = %paths.log_file().display(),
         portable = paths.portable,
+        sources = cfg.sources.len(),
+        first_run_at = ?state.first_run_at,
+        downloads = ?folders.downloads,
+        screenshots = ?folders.screenshots,
         "weekcase started"
     );
     Ok(ExitCode::SUCCESS)
