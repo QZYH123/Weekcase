@@ -26,7 +26,7 @@ fn run() -> io::Result<ExitCode> {
         Some(held) => held,
         None => return Ok(ExitCode::SUCCESS),
     };
-    let _log = log_init::init(&paths)?;
+    log_init::init(&paths)?;
     tracing::info!(
         config = %paths.config_file().display(),
         state = %paths.state_file().display(),

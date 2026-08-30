@@ -1,8 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-
-use tracing_appender::non_blocking::WorkerGuard;
+use std::sync::Mutex;
 
 use crate::paths::Paths;
 
@@ -10,21 +9,19 @@ const MAX_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_LOG_FILES: u32 = 3;
 const LOG_FILE_NAME: &str = "weekcase.log";
 
-pub fn init(paths: &Paths) -> io::Result<WorkerGuard> {
+pub fn init(paths: &Paths) -> io::Result<()> {
     let dir = paths.logs_dir();
     fs::create_dir_all(&dir)?;
     let rolling = SizeRollingFile::open(&dir, LOG_FILE_NAME, MAX_LOG_BYTES, MAX_LOG_FILES)?;
-    let (writer, guard) = tracing_appender::non_blocking(rolling);
     tracing_subscriber::fmt()
-        .with_writer(writer)
+        .with_writer(Mutex::new(rolling))
         .with_ansi(false)
         .with_max_level(tracing::Level::INFO)
         .try_init()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    Ok(guard)
+    Ok(())
 }
 
-/// Current file plus numbered backups (`weekcase.log`, `.1`, `.2` for 3 files).
 struct SizeRollingFile {
     dir: PathBuf,
     name: String,
