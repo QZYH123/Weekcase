@@ -7,10 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use weekcase::classify::{Bucket, FileSnapshot, Placement};
 use weekcase::config::{Collision, Config, SourceKind};
 use weekcase::execute::{
-    execute_move, resolve_dest, suffixed_file_name, ExecError, MAX_COLLISION_SUFFIX,
+    execute_move, resolve_dest, suffixed_file_name, undo_last, ExecError, MAX_COLLISION_SUFFIX,
 };
 use weekcase::state::AppState;
-use weekcase::undo::read_records;
+use weekcase::undo::{read_records, JournalOp, UndoError};
 
 static UNIQUE: AtomicU64 = AtomicU64::new(0);
 
@@ -154,5 +154,33 @@ fn skip_leaves_source_and_records_skipped() {
     let state = AppState::load(&dir.join("state.json")).unwrap();
     assert!(state.is_skipped(&from));
     assert!(read_records(&dir.join("undo.jsonl")).unwrap().is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn undo_does_not_overwrite_existing_source() {
+    let dir = temp_dir();
+    let from = dir.join("src").join("a.pdf");
+    fs::create_dir_all(from.parent().unwrap()).unwrap();
+    fs::write(&from, b"moved").unwrap();
+    let dest_dir = dir.join("dest");
+    let undo = dir.join("undo.jsonl");
+    execute_move(
+        &Config::default(),
+        &snap(from.clone(), 5),
+        &placement(dest_dir.clone(), "a.pdf"),
+        &undo,
+        &dir.join("state.json"),
+    )
+    .unwrap();
+    fs::write(&from, b"new at source").unwrap();
+    let dest = dest_dir.join("a.pdf");
+    let err = undo_last(&undo).unwrap_err();
+    assert!(matches!(err, UndoError::SourceExists));
+    assert_eq!(fs::read(&dest).unwrap(), b"moved");
+    assert_eq!(fs::read(&from).unwrap(), b"new at source");
+    let records = read_records(&undo).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].op, JournalOp::Move);
     let _ = fs::remove_dir_all(&dir);
 }

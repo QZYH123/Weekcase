@@ -57,7 +57,7 @@ impl AppState {
     }
 
     pub fn is_blocked_from(&self, from: &Path) -> bool {
-        self.blocked.iter().any(|b| b.from == from)
+        self.blocked.iter().any(|b| same_path(&b.from, from))
     }
 
     pub fn is_skipped(&self, path: &Path) -> bool {
@@ -65,7 +65,7 @@ impl AppState {
     }
 
     pub fn push_blocked(&mut self, from: PathBuf, to: PathBuf) {
-        self.blocked.retain(|b| b.from != from);
+        self.blocked.retain(|b| !same_path(&b.from, &from));
         if self.blocked.len() >= MAX_BLOCKED {
             self.blocked.remove(0);
         }
@@ -107,6 +107,28 @@ impl AppState {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         fs::write(path, bytes)
     }
+}
+
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
+    path_key(a) == path_key(b)
+}
+
+fn path_key(p: &Path) -> String {
+    let mut s: String = p
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c == '/' {
+                '\\'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    while s.ends_with('\\') && s != "\\" {
+        s.pop();
+    }
+    s
 }
 
 fn cap_vec<T>(items: &mut Vec<T>, max: usize) {
@@ -274,5 +296,20 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("watermark"));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn blocked_from_matches_slash_and_ascii_case() {
+        let mut state = AppState::default();
+        state.push_blocked(
+            PathBuf::from(r"C:\Users\a\foo.pdf"),
+            PathBuf::from(r"C:\out\foo.pdf"),
+        );
+        assert!(state.is_blocked_from(Path::new("C:/Users/a/foo.pdf")));
+        assert!(state.is_blocked_from(Path::new(r"c:\users\a\FOO.pdf")));
+        assert!(!state.is_blocked_from(Path::new(r"C:\Users\a\foo-1.pdf")));
+        state.push_blocked(PathBuf::from("C:/Users/a/foo.pdf"), PathBuf::from(r"D:\x"));
+        assert_eq!(state.blocked.len(), 1);
+        assert_eq!(state.blocked[0].to, PathBuf::from(r"D:\x"));
     }
 }

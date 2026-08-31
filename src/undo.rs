@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +36,7 @@ pub struct JournalRecord {
 pub enum UndoError {
     Empty,
     SourceExists,
+    SplitCopy,
     Io(io::Error),
 }
 
@@ -81,10 +82,12 @@ pub fn append_record(path: &Path, rec: &JournalRecord) -> io::Result<()> {
             fs::create_dir_all(dir)?;
         }
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    serde_json::to_writer(&mut file, rec)
+    let mut buf = Vec::new();
+    serde_json::to_writer(&mut buf, rec)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    file.write_all(b"\n")?;
+    buf.push(b'\n');
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&buf)?;
     file.sync_all()?;
     Ok(())
 }
@@ -171,13 +174,58 @@ fn write_records(path: &Path, records: &[JournalRecord]) -> io::Result<()> {
         buf.push(b'\n');
     }
     let tmp = path.with_extension("jsonl.tmp");
-    fs::write(&tmp, &buf)?;
-    let _ = fs::remove_file(path);
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
     }
+    replace_journal(&tmp, path)
+}
+
+/// Atomically put `tmp` over `dest`. Failure leaves `dest` untouched and keeps `tmp`.
+/// REPLACE_EXISTING is allowed only for this journal file, never for user archives.
+fn replace_journal(tmp: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let from_w = to_wide(tmp);
+        let to_w = to_wide(dest);
+        // SAFETY: both buffers are NUL-terminated UTF-16 and live for this call.
+        unsafe {
+            MoveFileExW(
+                PCWSTR::from_raw(from_w.as_ptr()),
+                PCWSTR::from_raw(to_w.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(win_to_io)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp, dest)
+    }
+}
+
+#[cfg(windows)]
+fn to_wide(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .chain(core::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn win_to_io(e: windows::core::Error) -> io::Error {
+    let hr = e.code().0 as u32;
+    let code = if hr & 0xFFFF_0000 == 0x8007_0000 {
+        (hr & 0xFFFF) as i32
+    } else {
+        e.code().0
+    };
+    io::Error::from_raw_os_error(code)
 }

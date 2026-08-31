@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::classify::{FileSnapshot, Placement};
 use crate::config::{Collision, Config};
-use crate::state::AppState;
+use crate::state::{same_path, AppState};
 use crate::undo::{
     append_record, last_undoable, new_move_id, now_rfc3339, read_records, undo_record, JournalOp,
     JournalRecord, UndoError, PROTOCOL_VERSION,
@@ -94,11 +94,14 @@ pub fn execute_move(
     if cfg.destination.collision == Collision::Skip {
         let dest = placement.dest_dir.join(&placement.dest_name);
         if path_exists(&dest) {
-            persist_skipped(state_path, snap.path.clone())?;
-            tracing::info!(path = %snap.path.display(), "skipped collision");
-            return Err(ExecError::Skipped);
+            return skip_collision(state_path, snap.path.clone());
         }
-        return try_move(snap, &dest, undo_path, state_path);
+        return match try_move(snap, &dest, undo_path, state_path) {
+            Err(ExecError::Io(e)) if is_dest_occupied(&e) => {
+                skip_collision(state_path, snap.path.clone())
+            }
+            other => other,
+        };
     }
 
     for n in 0..=MAX_COLLISION_SUFFIX {
@@ -118,20 +121,21 @@ pub fn execute_move(
 
 pub fn undo_last(undo_path: &Path) -> Result<JournalRecord, UndoError> {
     let records = read_records(undo_path)?;
-    let Some(mv) = last_undoable(&records).cloned() else {
+    let Some(mv) = last_undoable(&records) else {
         return Err(UndoError::Empty);
     };
     if !path_exists(&mv.to) {
         tracing::warn!(to = %mv.to.display(), "文件已不在落点");
-        let rec = undo_record(&mv);
+        let rec = undo_record(mv);
         append_record(undo_path, &rec)?;
         return Ok(rec);
     }
     if path_exists(&mv.from) {
         return Err(UndoError::SourceExists);
     }
-    move_file(&mv.to, &mv.from, false).map_err(UndoError::Io)?;
-    let rec = undo_record(&mv);
+    let move_result = move_file(&mv.to, &mv.from, false);
+    settle_undo(&mv.from, &mv.to, move_result)?;
+    let rec = undo_record(mv);
     append_record(undo_path, &rec)?;
     tracing::info!(from = %mv.from.display(), to = %mv.to.display(), "undone");
     Ok(rec)
@@ -182,7 +186,7 @@ fn settle_after_move(
     match move_result {
         Ok(()) => {
             if from_ex && to_ex {
-                return Err(handle_split(from, to, state_path));
+                return handle_split(from, to, state_path);
             }
             if to_ex && !from_ex {
                 return Ok(());
@@ -200,14 +204,57 @@ fn settle_after_move(
                 return Ok(());
             }
             if to_ex && from_ex {
-                return Err(handle_split(from, to, state_path));
+                return handle_split(from, to, state_path);
             }
             Err(map_move_err(e))
         }
     }
 }
 
-fn handle_split(from: &Path, to: &Path, state_path: &Path) -> ExecError {
+fn settle_undo(from: &Path, to: &Path, move_result: io::Result<()>) -> Result<(), UndoError> {
+    let from_ex = path_exists(from);
+    let to_ex = path_exists(to);
+    match move_result {
+        Ok(()) => finalize_undo(from, to, from_ex, to_ex),
+        Err(e) => {
+            if is_dest_occupied(&e) {
+                return Err(UndoError::SourceExists);
+            }
+            match finalize_undo(from, to, from_ex, to_ex) {
+                Ok(()) => Ok(()),
+                Err(UndoError::SplitCopy) => Err(UndoError::SplitCopy),
+                Err(_) => Err(UndoError::Io(e)),
+            }
+        }
+    }
+}
+
+fn finalize_undo(from: &Path, to: &Path, from_ex: bool, to_ex: bool) -> Result<(), UndoError> {
+    if from_ex && !to_ex {
+        return Ok(());
+    }
+    if from_ex && to_ex {
+        match delete_file(to) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::error!(
+                    from = %from.display(),
+                    to = %to.display(),
+                    error = %e,
+                    "undo split copy; dest not removed"
+                );
+                Err(UndoError::SplitCopy)
+            }
+        }
+    } else {
+        Err(UndoError::Io(io::Error::new(
+            io::ErrorKind::Other,
+            "undo did not restore the source",
+        )))
+    }
+}
+
+fn handle_split(from: &Path, to: &Path, state_path: &Path) -> Result<(), ExecError> {
     match delete_file(to) {
         Ok(()) => {
             tracing::error!(
@@ -215,7 +262,7 @@ fn handle_split(from: &Path, to: &Path, state_path: &Path) -> ExecError {
                 to = %to.display(),
                 "cross-volume copy left source; dest removed"
             );
-            ExecError::CopyLeftSource
+            Err(ExecError::CopyLeftSource)
         }
         Err(e) => {
             tracing::error!(
@@ -224,10 +271,16 @@ fn handle_split(from: &Path, to: &Path, state_path: &Path) -> ExecError {
                 error = %e,
                 "split copy; blocked"
             );
-            persist_blocked(state_path, from.to_path_buf(), to.to_path_buf());
-            ExecError::SplitCopy
+            persist_blocked(state_path, from.to_path_buf(), to.to_path_buf())?;
+            Err(ExecError::SplitCopy)
         }
     }
+}
+
+fn skip_collision(state_path: &Path, path: PathBuf) -> Result<JournalRecord, ExecError> {
+    persist_skipped(state_path, path.clone())?;
+    tracing::info!(path = %path.display(), "skipped collision");
+    Err(ExecError::Skipped)
 }
 
 fn persist_skipped(state_path: &Path, path: PathBuf) -> io::Result<()> {
@@ -236,37 +289,10 @@ fn persist_skipped(state_path: &Path, path: PathBuf) -> io::Result<()> {
     state.save(state_path)
 }
 
-fn persist_blocked(state_path: &Path, from: PathBuf, to: PathBuf) {
-    match AppState::load(state_path) {
-        Ok(mut state) => {
-            state.push_blocked(from, to);
-            if let Err(e) = state.save(state_path) {
-                tracing::error!(error = %e, "failed to persist blocked pair");
-            }
-        }
-        Err(e) => tracing::error!(error = %e, "failed to load state for blocked pair"),
-    }
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    fn key(p: &Path) -> String {
-        let mut s: String = p
-            .to_string_lossy()
-            .chars()
-            .map(|c| {
-                if c == '/' {
-                    '\\'
-                } else {
-                    c.to_ascii_lowercase()
-                }
-            })
-            .collect();
-        while s.ends_with('\\') && s != "\\" {
-            s.pop();
-        }
-        s
-    }
-    key(a) == key(b)
+fn persist_blocked(state_path: &Path, from: PathBuf, to: PathBuf) -> io::Result<()> {
+    let mut state = AppState::load(state_path)?;
+    state.push_blocked(from, to);
+    state.save(state_path)
 }
 
 fn path_exists(path: &Path) -> bool {
@@ -290,9 +316,26 @@ fn delete_file(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::DeleteFileW;
+        use windows::Win32::Storage::FileSystem::{
+            DeleteFileW, GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
+            FILE_FLAGS_AND_ATTRIBUTES, INVALID_FILE_ATTRIBUTES,
+        };
 
         let wide = to_wide(path);
+        // SAFETY: `wide` is NUL-terminated UTF-16 and lives for this call.
+        let attr = unsafe { GetFileAttributesW(PCWSTR::from_raw(wide.as_ptr())) };
+        if attr != INVALID_FILE_ATTRIBUTES {
+            let cleared = attr & !FILE_ATTRIBUTE_READONLY.0;
+            if cleared != attr {
+                // Cross-volume copy keeps READONLY; DeleteFileW would then ACCESS_DENIED.
+                let _ = unsafe {
+                    SetFileAttributesW(
+                        PCWSTR::from_raw(wide.as_ptr()),
+                        FILE_FLAGS_AND_ATTRIBUTES(cleared),
+                    )
+                };
+            }
+        }
         // SAFETY: `wide` is NUL-terminated UTF-16 and lives for this call.
         unsafe { DeleteFileW(PCWSTR::from_raw(wide.as_ptr())) }.map_err(win_to_io)
     }
@@ -329,10 +372,69 @@ fn move_file(from: &Path, to: &Path, write_through: bool) -> io::Result<()> {
     #[cfg(not(windows))]
     {
         let _ = write_through;
-        if path_exists(to) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "dest exists"));
-        }
-        fs::rename(from, to)
+        rename_noreplace(from, to)
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_renameat2_noreplace(from, to)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::fs::{File, OpenOptions};
+        use std::io::{self as io_copy, Write};
+        let mut dest = OpenOptions::new().write(true).create_new(true).open(to)?;
+        let mut src = File::open(from)?;
+        io_copy::copy(&mut src, &mut dest)?;
+        dest.flush()?;
+        dest.sync_all()?;
+        drop(dest);
+        fs::remove_file(from)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_renameat2_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const AT_FDCWD: i32 = -100;
+    const RENAME_NOREPLACE: u32 = 1;
+
+    extern "C" {
+        fn renameat2(
+            olddirfd: i32,
+            oldpath: *const std::ffi::c_char,
+            newdirfd: i32,
+            newpath: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+
+    fn cstr(path: &Path) -> io::Result<CString> {
+        CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains interior NUL"))
+    }
+
+    let old = cstr(from)?;
+    let new = cstr(to)?;
+    // SAFETY: both CStrings are NUL-terminated and live for this call.
+    let rc = unsafe {
+        renameat2(
+            AT_FDCWD,
+            old.as_ptr(),
+            AT_FDCWD,
+            new.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -465,7 +567,7 @@ mod tests {
         fs::write(&from, b"abc").unwrap();
         fs::write(&to, b"abc").unwrap();
         let state_path = dir.join("state.json");
-        let err = handle_split(&from, &to, &state_path);
+        let err = handle_split(&from, &to, &state_path).unwrap_err();
         assert!(matches!(err, ExecError::CopyLeftSource));
         assert!(from.exists());
         assert!(!to.exists());
@@ -482,7 +584,7 @@ mod tests {
         fs::write(&from, b"abc").unwrap();
         fs::create_dir(&to).unwrap();
         let state_path = dir.join("state.json");
-        let err = handle_split(&from, &to, &state_path);
+        let err = handle_split(&from, &to, &state_path).unwrap_err();
         assert!(matches!(err, ExecError::SplitCopy));
         assert!(from.exists());
         assert!(to.exists());
@@ -570,6 +672,86 @@ mod tests {
         assert_eq!(fs::read(dest_dir.join("foo.pdf")).unwrap(), b"old");
         assert_eq!(fs::read(dest_dir.join("foo-1.pdf")).unwrap(), b"new");
         assert_eq!(rec.to.file_name().unwrap(), "foo-1.pdf");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_does_not_overwrite_existing_source() {
+        let dir = temp_dir();
+        let from = dir.join("src").join("a.pdf");
+        fs::create_dir_all(from.parent().unwrap()).unwrap();
+        fs::write(&from, b"moved").unwrap();
+        let dest_dir = dir.join("dest");
+        let undo = dir.join("undo.jsonl");
+        execute_move(
+            &Config::default(),
+            &snap_at(from.clone(), 5),
+            &place(dest_dir.clone(), "a.pdf"),
+            &undo,
+            &dir.join("state.json"),
+        )
+        .unwrap();
+        fs::write(&from, b"new at source").unwrap();
+        let dest = dest_dir.join("a.pdf");
+        let err = undo_last(&undo).unwrap_err();
+        assert!(matches!(err, UndoError::SourceExists));
+        assert_eq!(fs::read(&dest).unwrap(), b"moved");
+        assert_eq!(fs::read(&from).unwrap(), b"new at source");
+        let records = read_records(&undo).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].op, JournalOp::Move);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_split_deletes_archive_copy() {
+        let dir = temp_dir();
+        let from = dir.join("from.bin");
+        let to = dir.join("to.bin");
+        fs::write(&from, b"copy").unwrap();
+        fs::write(&to, b"archive").unwrap();
+        settle_undo(&from, &to, Ok(())).unwrap();
+        assert_eq!(fs::read(&from).unwrap(), b"copy");
+        assert!(!to.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_split_leaves_both_without_success() {
+        let dir = temp_dir();
+        let from = dir.join("from.bin");
+        let to = dir.join("to_dir");
+        fs::write(&from, b"copy").unwrap();
+        fs::create_dir(&to).unwrap();
+        let err = settle_undo(&from, &to, Ok(())).unwrap_err();
+        assert!(matches!(err, UndoError::SplitCopy));
+        assert!(from.exists());
+        assert!(to.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocked_from_matches_path_key() {
+        let dir = temp_dir();
+        let from = dir.join("a.pdf");
+        fs::write(&from, b"data").unwrap();
+        let dest_dir = dir.join("out");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let mut state = AppState::default();
+        let alt = PathBuf::from(from.to_string_lossy().replace('/', "\\"));
+        state.push_blocked(alt, dest_dir.join("a.pdf"));
+        let state_path = dir.join("state.json");
+        state.save(&state_path).unwrap();
+        let err = execute_move(
+            &Config::default(),
+            &snap_at(from.clone(), 4),
+            &place(dest_dir.clone(), "a.pdf"),
+            &dir.join("undo.jsonl"),
+            &state_path,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecError::Blocked));
+        assert!(from.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
