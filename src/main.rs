@@ -1,13 +1,18 @@
 #![windows_subsystem = "windows"]
 
+use std::collections::HashMap;
 use std::io;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use weekcase::config;
 use weekcase::known_folders::KnownFolders;
 use weekcase::log_init;
 use weekcase::paths::Paths;
+use weekcase::stabilize;
 use weekcase::state::AppState;
+use weekcase::watch;
 
 const SINGLE_INSTANCE_MUTEX: &str = r"Local\Weekcase.SingleInstance";
 
@@ -43,6 +48,23 @@ fn run() -> io::Result<ExitCode> {
         screenshots = ?folders.screenshots,
         "weekcase started"
     );
+    let paused = Arc::new(AtomicBool::new(cfg.general.paused));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let cfg = Arc::new(cfg);
+    let state = Arc::new(Mutex::new(state));
+    let candidates = Arc::new(Mutex::new(HashMap::new()));
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let watch = watch::start_watch(
+        Arc::clone(&cfg),
+        Arc::clone(&state),
+        Arc::clone(&candidates),
+        cmd_rx,
+    );
+    let _stab =
+        stabilize::start_stabilize(Arc::clone(&cfg), candidates, paused, Arc::clone(&shutdown));
+    let _cmd_tx = cmd_tx;
+    let _ = watch.join();
+    shutdown.store(true, Ordering::Relaxed);
     Ok(ExitCode::SUCCESS)
 }
 

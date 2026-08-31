@@ -1,5 +1,8 @@
+pub mod candidate;
 pub mod config;
 pub mod known_folders;
 pub mod log_init;
 pub mod paths;
+pub mod stabilize;
 pub mod state;
+pub mod watch;

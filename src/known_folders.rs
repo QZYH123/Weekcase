@@ -141,7 +141,7 @@ pub fn deny_destination_with(
     None
 }
 
-fn is_same_or_inside(inner: &Path, outer: &Path) -> bool {
+pub(crate) fn is_same_or_inside(inner: &Path, outer: &Path) -> bool {
     let inner = canonical_key(inner);
     let outer = canonical_key(outer);
     if inner.is_empty() || outer.is_empty() {
@@ -150,7 +150,7 @@ fn is_same_or_inside(inner: &Path, outer: &Path) -> bool {
     inner == outer || inner.starts_with(&format!("{outer}\\"))
 }
 
-fn canonical_key(path: &Path) -> String {
+pub(crate) fn canonical_key(path: &Path) -> String {
     let mut s: String = path
         .to_string_lossy()
         .chars()
