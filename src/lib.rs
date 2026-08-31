@@ -1,9 +1,11 @@
 pub mod candidate;
 pub mod classify;
 pub mod config;
+pub mod execute;
 pub mod known_folders;
 pub mod log_init;
 pub mod paths;
 pub mod stabilize;
 pub mod state;
+pub mod undo;
 pub mod watch;

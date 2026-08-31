@@ -122,7 +122,7 @@ fn unix_secs(at: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn format_rfc3339_utc(secs: u64) -> String {
+pub(crate) fn format_rfc3339_utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let hh = rem / 3_600;
