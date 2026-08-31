@@ -3,19 +3,30 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::candidate::{Candidate, FileSnapshot};
+use crate::classify::{classify, ClassifyError};
 use crate::config::Config;
+use crate::execute::{execute_move, ExecError};
+use crate::known_folders::KnownFolders;
+use crate::state::AppState;
 use crate::watch::{inspect_file, is_ignored, FileInfo, IgnoreSet};
 
 const ZERO_BYTE_MIN_AGE: Duration = Duration::from_secs(60);
+const ERROR_EVERY: Duration = Duration::from_secs(60);
+const MAX_ATTEMPTS: u32 = 5;
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_stabilize(
     cfg: Arc<Config>,
     candidates: Arc<Mutex<HashMap<PathBuf, Candidate>>>,
     paused: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    folders: KnownFolders,
+    undo_path: PathBuf,
+    state_path: PathBuf,
+    state: Arc<Mutex<AppState>>,
 ) -> JoinHandle<()> {
     let ignore = IgnoreSet::from_process();
     thread::Builder::new()
@@ -23,9 +34,11 @@ pub fn start_stabilize(
         .spawn(move || {
             let tick = Duration::from_millis(cfg.watch.tick_ms.max(1));
             let mut logged = HashSet::new();
+            let mut limiter = LogLimiter::default();
+            let mut illegal_warned = HashSet::new();
             while !shutdown.load(Ordering::Relaxed) {
-                let paused = paused.load(Ordering::Relaxed);
-                let ready = tick_once(&candidates, &ignore, SystemTime::now(), paused);
+                let paused_now = paused.load(Ordering::Relaxed);
+                let ready = tick_once(&candidates, &ignore, SystemTime::now(), paused_now);
                 for snap in take_new_ready(&ready, &mut logged) {
                     tracing::info!(
                         path = %snap.path.display(),
@@ -33,6 +46,17 @@ pub fn start_stabilize(
                         size = snap.size,
                         "ready_for_execute"
                     );
+                }
+                if !ready.is_empty() && !paused.load(Ordering::Relaxed) {
+                    let ctx = ReadyCtx {
+                        cfg: &cfg,
+                        folders: &folders,
+                        candidates: &candidates,
+                        live: &state,
+                        undo_path: &undo_path,
+                        state_path: &state_path,
+                    };
+                    execute_ready(&ctx, &ready, &mut limiter, &mut illegal_warned);
                 }
                 thread::sleep(tick);
             }
@@ -127,6 +151,167 @@ fn take_new_ready<'a>(
         .collect()
 }
 
+struct ReadyCtx<'a> {
+    cfg: &'a Config,
+    folders: &'a KnownFolders,
+    candidates: &'a Mutex<HashMap<PathBuf, Candidate>>,
+    live: &'a Mutex<AppState>,
+    undo_path: &'a Path,
+    state_path: &'a Path,
+}
+
+enum Outcome {
+    Moved,
+    Classify(ClassifyError),
+    Exec(ExecError),
+}
+
+enum Next {
+    Continue,
+    Stop,
+}
+
+#[derive(Default)]
+struct LogLimiter {
+    last: HashMap<&'static str, Instant>,
+}
+
+impl LogLimiter {
+    fn allow(&mut self, key: &'static str) -> bool {
+        let now = Instant::now();
+        if self
+            .last
+            .get(&key)
+            .is_some_and(|prev| now.saturating_duration_since(*prev) < ERROR_EVERY)
+        {
+            return false;
+        }
+        self.last.insert(key, now);
+        true
+    }
+}
+
+fn execute_ready(
+    ctx: &ReadyCtx<'_>,
+    ready: &[FileSnapshot],
+    limiter: &mut LogLimiter,
+    illegal_warned: &mut HashSet<PathBuf>,
+) {
+    for snap in ready {
+        // classify + Move run with no candidate lock (T1 may upsert during a cross-volume copy).
+        let outcome = match classify(ctx.cfg, snap, ctx.folders) {
+            Err(err) => Outcome::Classify(err),
+            Ok(placement) => {
+                match execute_move(ctx.cfg, snap, &placement, ctx.undo_path, ctx.state_path) {
+                    Ok(_) => Outcome::Moved,
+                    Err(err) => Outcome::Exec(err),
+                }
+            }
+        };
+        if matches!(
+            apply_outcome(ctx, &snap.path, outcome, limiter, illegal_warned),
+            Next::Stop
+        ) {
+            break;
+        }
+    }
+}
+
+fn apply_outcome(
+    ctx: &ReadyCtx<'_>,
+    path: &Path,
+    outcome: Outcome,
+    limiter: &mut LogLimiter,
+    illegal_warned: &mut HashSet<PathBuf>,
+) -> Next {
+    match outcome {
+        Outcome::Moved => {
+            remove_candidate(ctx.candidates, path);
+            Next::Continue
+        }
+        Outcome::Classify(ClassifyError::BadTemplate) => {
+            if limiter.allow("classify_bad_template") {
+                tracing::error!(path = %path.display(), "bad destination template");
+            }
+            remove_candidate(ctx.candidates, path);
+            Next::Continue
+        }
+        Outcome::Classify(ClassifyError::DestInsideSource) => {
+            if limiter.allow("classify_dest_inside") {
+                tracing::error!(path = %path.display(), "destination inside source or denylist");
+            }
+            poison_candidate(ctx.candidates, path);
+            Next::Continue
+        }
+        Outcome::Classify(ClassifyError::IllegalName) => {
+            if illegal_warned.insert(path.to_path_buf()) {
+                tracing::warn!(path = %path.display(), "illegal file name");
+            }
+            remove_candidate(ctx.candidates, path);
+            Next::Continue
+        }
+        Outcome::Exec(ExecError::Skipped) => {
+            {
+                let mut live = ctx.live.lock().unwrap_or_else(|e| e.into_inner());
+                live.push_skipped(path.to_path_buf());
+            }
+            remove_candidate(ctx.candidates, path);
+            Next::Continue
+        }
+        Outcome::Exec(ExecError::SplitCopy)
+        | Outcome::Exec(ExecError::Blocked)
+        | Outcome::Exec(ExecError::SamePath)
+        | Outcome::Exec(ExecError::CollisionLimit) => {
+            if limiter.allow("exec_poison") {
+                tracing::error!(path = %path.display(), "move poisoned");
+            }
+            poison_candidate(ctx.candidates, path);
+            Next::Continue
+        }
+        Outcome::Exec(ExecError::DiskFull) => {
+            if limiter.allow("exec_disk_full") {
+                tracing::error!(path = %path.display(), "disk full");
+            }
+            Next::Stop
+        }
+        Outcome::Exec(ExecError::SharingViolation)
+        | Outcome::Exec(ExecError::AccessDenied)
+        | Outcome::Exec(ExecError::CopyLeftSource)
+        | Outcome::Exec(ExecError::Io(_)) => {
+            let attempts = bump_attempts(ctx.candidates, path);
+            if attempts >= MAX_ATTEMPTS && limiter.allow("exec_retry") {
+                tracing::error!(path = %path.display(), attempts, "move failed");
+            }
+            Next::Continue
+        }
+    }
+}
+
+fn remove_candidate(table: &Mutex<HashMap<PathBuf, Candidate>>, path: &Path) {
+    table.lock().unwrap_or_else(|e| e.into_inner()).remove(path);
+}
+
+fn poison_candidate(table: &Mutex<HashMap<PathBuf, Candidate>>, path: &Path) {
+    if let Some(cand) = table
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(path)
+    {
+        cand.poisoned = true;
+    }
+}
+
+fn bump_attempts(table: &Mutex<HashMap<PathBuf, Candidate>>, path: &Path) -> u32 {
+    let mut table = table.lock().unwrap_or_else(|e| e.into_inner());
+    match table.get_mut(path) {
+        Some(cand) => {
+            cand.attempts = cand.attempts.saturating_add(1);
+            cand.attempts
+        }
+        None => 0,
+    }
+}
+
 fn lock_probe_ok(path: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -182,7 +367,11 @@ fn lock_probe_windows(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::config::Collision;
     use crate::config::SourceKind;
+    #[cfg(windows)]
+    use crate::undo::{read_records, JournalOp};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::UNIX_EPOCH;
@@ -220,6 +409,95 @@ mod tests {
             poisoned: false,
             settle_secs,
         }
+    }
+
+    fn cand_ready() -> Candidate {
+        Candidate {
+            source_id: "downloads".into(),
+            source_kind: SourceKind::Downloads,
+            first_seen: SystemTime::now(),
+            last_size: 1,
+            last_mtime: UNIX_EPOCH,
+            created: UNIX_EPOCH,
+            stable_since: Some(UNIX_EPOCH),
+            attempts: 0,
+            poisoned: false,
+            settle_secs: 0,
+        }
+    }
+
+    fn win_folders() -> KnownFolders {
+        KnownFolders {
+            downloads: Some(PathBuf::from(r"C:\Users\a\Downloads")),
+            screenshots: Some(PathBuf::from(r"C:\Users\a\Pictures\Screenshots")),
+            documents: Some(PathBuf::from(r"C:\Users\a\Documents")),
+            profile: Some(PathBuf::from(r"C:\Users\a")),
+            windows: Some(PathBuf::from(r"C:\Windows")),
+            program_files: vec![
+                PathBuf::from(r"C:\Program Files"),
+                PathBuf::from(r"C:\Program Files (x86)"),
+            ],
+            program_data: Some(PathBuf::from(r"C:\ProgramData")),
+            ..KnownFolders::default()
+        }
+    }
+
+    fn snap_at(path: PathBuf) -> FileSnapshot {
+        FileSnapshot {
+            path,
+            source_id: "downloads".into(),
+            source_kind: SourceKind::Downloads,
+            size: 1,
+            mtime: UNIX_EPOCH,
+            created: UNIX_EPOCH,
+        }
+    }
+
+    fn run_ready(
+        cfg: &Config,
+        folders: &KnownFolders,
+        table: &Mutex<HashMap<PathBuf, Candidate>>,
+        live: &Mutex<AppState>,
+        dir: &Path,
+        ready: &[FileSnapshot],
+    ) {
+        let undo = dir.join("undo.jsonl");
+        let state_path = dir.join("state.json");
+        let ctx = ReadyCtx {
+            cfg,
+            folders,
+            candidates: table,
+            live,
+            undo_path: &undo,
+            state_path: &state_path,
+        };
+        let mut limiter = LogLimiter::default();
+        let mut illegal = HashSet::new();
+        execute_ready(&ctx, ready, &mut limiter, &mut illegal);
+    }
+
+    fn apply(
+        table: &Mutex<HashMap<PathBuf, Candidate>>,
+        live: &Mutex<AppState>,
+        dir: &Path,
+        path: &Path,
+        outcome: Outcome,
+    ) -> Next {
+        let cfg = Config::default();
+        let folders = KnownFolders::default();
+        let undo = dir.join("undo.jsonl");
+        let state_path = dir.join("state.json");
+        let ctx = ReadyCtx {
+            cfg: &cfg,
+            folders: &folders,
+            candidates: table,
+            live,
+            undo_path: &undo,
+            state_path: &state_path,
+        };
+        let mut limiter = LogLimiter::default();
+        let mut illegal = HashSet::new();
+        apply_outcome(&ctx, path, outcome, &mut limiter, &mut illegal)
     }
 
     #[test]
@@ -310,6 +588,219 @@ mod tests {
         assert!(table.lock().unwrap()[&path].stable_since.is_some());
         let ready = tick_once(&table, &ignore(), now, false);
         assert_eq!(ready.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_probe_success_zeros_attempts() {
+        let dir = temp_dir();
+        let (path, info) = insert_file(&dir, "a.pdf", b"x");
+        let mut cand = candidate(&info, 0);
+        cand.attempts = 4;
+        cand.stable_since = Some(UNIX_EPOCH);
+        let table = Mutex::new(HashMap::from([(path.clone(), cand)]));
+        let ready = tick_once(&table, &ignore(), SystemTime::now(), false);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(table.lock().unwrap()[&path].attempts, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_template_drops_candidate() {
+        let dir = temp_dir();
+        let path = PathBuf::from(r"C:\Users\a\Downloads\a.pdf");
+        let table = Mutex::new(HashMap::from([(path.clone(), cand_ready())]));
+        let mut cfg = Config::default();
+        cfg.destination.root = Some(r"C:\Users\a\Documents\Weekcase".into());
+        cfg.destination.downloads_template = "{root}/{ww}".into();
+        let live = Mutex::new(AppState::default());
+        run_ready(
+            &cfg,
+            &win_folders(),
+            &table,
+            &live,
+            &dir,
+            &[snap_at(path.clone())],
+        );
+        assert!(table.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dest_inside_source_poisons() {
+        let dir = temp_dir();
+        let path = PathBuf::from(r"C:\Users\a\Downloads\a.pdf");
+        let table = Mutex::new(HashMap::from([(path.clone(), cand_ready())]));
+        let mut cfg = Config::default();
+        cfg.destination.root = Some(r"C:\Users\a\Downloads\Weekcase".into());
+        let live = Mutex::new(AppState::default());
+        run_ready(
+            &cfg,
+            &win_folders(),
+            &table,
+            &live,
+            &dir,
+            &[snap_at(path.clone())],
+        );
+        let t = table.lock().unwrap();
+        assert!(t[&path].poisoned);
+        assert_eq!(t.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn illegal_name_drops_once() {
+        let dir = temp_dir();
+        let path = PathBuf::from(r"C:\Users\a\Downloads\..");
+        let table = Mutex::new(HashMap::from([(path.clone(), cand_ready())]));
+        let mut cfg = Config::default();
+        cfg.destination.root = Some(r"C:\Users\a\Documents\Weekcase".into());
+        let live = Mutex::new(AppState::default());
+        run_ready(
+            &cfg,
+            &win_folders(),
+            &table,
+            &live,
+            &dir,
+            &[snap_at(path.clone())],
+        );
+        assert!(table.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sharing_increments_attempts() {
+        let dir = temp_dir();
+        let path = PathBuf::from(r"C:\Users\a\Downloads\a.pdf");
+        let table = Mutex::new(HashMap::from([(path.clone(), cand_ready())]));
+        let live = Mutex::new(AppState::default());
+        let next = apply(
+            &table,
+            &live,
+            &dir,
+            &path,
+            Outcome::Exec(ExecError::SharingViolation),
+        );
+        assert!(matches!(next, Next::Continue));
+        let t = table.lock().unwrap();
+        assert_eq!(t[&path].attempts, 1);
+        assert!(!t[&path].poisoned);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_full_stops_without_burning_attempts() {
+        let dir = temp_dir();
+        let path = PathBuf::from(r"C:\Users\a\Downloads\a.pdf");
+        let table = Mutex::new(HashMap::from([(path.clone(), cand_ready())]));
+        let live = Mutex::new(AppState::default());
+        let next = apply(
+            &table,
+            &live,
+            &dir,
+            &path,
+            Outcome::Exec(ExecError::DiskFull),
+        );
+        assert!(matches!(next, Next::Stop));
+        assert_eq!(table.lock().unwrap()[&path].attempts, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skipped_removes_and_records_live_state() {
+        let dir = temp_dir();
+        let path = PathBuf::from(r"C:\Users\a\Downloads\a.pdf");
+        let table = Mutex::new(HashMap::from([(path.clone(), cand_ready())]));
+        let live = Mutex::new(AppState::default());
+        apply(
+            &table,
+            &live,
+            &dir,
+            &path,
+            Outcome::Exec(ExecError::Skipped),
+        );
+        assert!(table.lock().unwrap().is_empty());
+        assert!(live.lock().unwrap().is_skipped(&path));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_copy_poisons() {
+        let dir = temp_dir();
+        let path = PathBuf::from(r"C:\Users\a\Downloads\a.pdf");
+        let table = Mutex::new(HashMap::from([(path.clone(), cand_ready())]));
+        let live = Mutex::new(AppState::default());
+        apply(
+            &table,
+            &live,
+            &dir,
+            &path,
+            Outcome::Exec(ExecError::SplitCopy),
+        );
+        assert!(table.lock().unwrap()[&path].poisoned);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn moved_removes_candidate() {
+        let dir = temp_dir();
+        let path = PathBuf::from(r"C:\Users\a\Downloads\a.pdf");
+        let table = Mutex::new(HashMap::from([(path.clone(), cand_ready())]));
+        let live = Mutex::new(AppState::default());
+        apply(&table, &live, &dir, &path, Outcome::Moved);
+        assert!(table.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipeline_classifies_moves_and_appends_undo() {
+        let dir = temp_dir();
+        let src = dir.join("src");
+        let archive = dir.join("archive");
+        fs::create_dir_all(&src).unwrap();
+        let (path, info) = insert_file(&src, "a.pdf", b"hello");
+        let table = Mutex::new(HashMap::from([(path.clone(), candidate(&info, 0))]));
+        let mut cfg = Config::default();
+        cfg.destination.root = Some(archive.to_string_lossy().into_owned());
+        cfg.sources[0].path = Some(src.to_string_lossy().into_owned());
+        let live = Mutex::new(AppState::default());
+        let ready = tick_once(&table, &ignore(), SystemTime::now(), false);
+        assert_eq!(ready.len(), 1);
+        run_ready(&cfg, &KnownFolders::default(), &table, &live, &dir, &ready);
+        assert!(!path.exists());
+        let dest = archive.join("Downloads").join("Documents").join("a.pdf");
+        assert_eq!(fs::read(&dest).unwrap(), b"hello");
+        assert!(table.lock().unwrap().is_empty());
+        let recs = read_records(&dir.join("undo.jsonl")).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].op, JournalOp::Move);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipeline_skip_collision_removes_without_move() {
+        let dir = temp_dir();
+        let src = dir.join("src");
+        let archive = dir.join("archive");
+        let dest_dir = archive.join("Downloads").join("Documents");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        let (path, info) = insert_file(&src, "a.pdf", b"new");
+        fs::write(dest_dir.join("a.pdf"), b"old").unwrap();
+        let table = Mutex::new(HashMap::from([(path.clone(), candidate(&info, 0))]));
+        let mut cfg = Config::default();
+        cfg.destination.root = Some(archive.to_string_lossy().into_owned());
+        cfg.destination.collision = Collision::Skip;
+        cfg.sources[0].path = Some(src.to_string_lossy().into_owned());
+        let live = Mutex::new(AppState::default());
+        let ready = tick_once(&table, &ignore(), SystemTime::now(), false);
+        run_ready(&cfg, &KnownFolders::default(), &table, &live, &dir, &ready);
+        assert!(path.exists());
+        assert_eq!(fs::read(dest_dir.join("a.pdf")).unwrap(), b"old");
+        assert!(table.lock().unwrap().is_empty());
+        assert!(live.lock().unwrap().is_skipped(&path));
         let _ = fs::remove_dir_all(&dir);
     }
 }

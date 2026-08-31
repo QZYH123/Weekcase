@@ -5,6 +5,7 @@ use std::io;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::SystemTime;
 
 use weekcase::config;
 use weekcase::known_folders::KnownFolders;
@@ -12,6 +13,7 @@ use weekcase::log_init;
 use weekcase::paths::Paths;
 use weekcase::stabilize;
 use weekcase::state::AppState;
+use weekcase::undo;
 use weekcase::watch;
 
 const SINGLE_INSTANCE_MUTEX: &str = r"Local\Weekcase.SingleInstance";
@@ -34,7 +36,20 @@ fn run() -> io::Result<ExitCode> {
     };
     log_init::init(&paths)?;
     let cfg = config::load_or_default(&paths.config_file())?;
-    let state = AppState::load(&paths.state_file())?;
+    let mut state = AppState::load(&paths.state_file())?;
+    if state.first_run_at.is_none() {
+        state.stamp_first_run(SystemTime::now());
+        if let Err(err) = state.save(&paths.state_file()) {
+            tracing::error!(%err, "persist first_run_at failed");
+        }
+    }
+    if let Err(err) = undo::compact_journal(
+        &paths.undo_file(),
+        undo::UNDO_CAPACITY,
+        undo::UNDO_MAX_BYTES,
+    ) {
+        tracing::error!(%err, "undo compact failed");
+    }
     let folders = KnownFolders::resolve();
     tracing::info!(
         config = %paths.config_file().display(),
@@ -60,8 +75,16 @@ fn run() -> io::Result<ExitCode> {
         Arc::clone(&candidates),
         cmd_rx,
     );
-    let _stab =
-        stabilize::start_stabilize(Arc::clone(&cfg), candidates, paused, Arc::clone(&shutdown));
+    let _stab = stabilize::start_stabilize(
+        Arc::clone(&cfg),
+        candidates,
+        paused,
+        Arc::clone(&shutdown),
+        folders,
+        paths.undo_file(),
+        paths.state_file(),
+        Arc::clone(&state),
+    );
     let _cmd_tx = cmd_tx;
     let _ = watch.join();
     shutdown.store(true, Ordering::Relaxed);

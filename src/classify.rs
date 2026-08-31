@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::{Config, SourceKind};
 use crate::known_folders::{deny_destination_with, KnownFolders};
 
+pub use crate::candidate::FileSnapshot;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bucket {
     Images,
@@ -44,16 +46,6 @@ pub enum ClassifyError {
     BadTemplate,
     DestInsideSource,
     IllegalName,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileSnapshot {
-    pub path: PathBuf,
-    pub source_id: String,
-    pub source_kind: SourceKind,
-    pub size: u64,
-    pub mtime: SystemTime,
-    pub created: SystemTime,
 }
 
 pub fn classify(

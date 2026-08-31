@@ -271,7 +271,14 @@ fn handle_split(from: &Path, to: &Path, state_path: &Path) -> Result<(), ExecErr
                 error = %e,
                 "split copy; blocked"
             );
-            persist_blocked(state_path, from.to_path_buf(), to.to_path_buf())?;
+            if let Err(err) = persist_blocked(state_path, from.to_path_buf(), to.to_path_buf()) {
+                tracing::error!(
+                    from = %from.display(),
+                    to = %to.display(),
+                    error = %err,
+                    "persist blocked failed"
+                );
+            }
             Err(ExecError::SplitCopy)
         }
     }
