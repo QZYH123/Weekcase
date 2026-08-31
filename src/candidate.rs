@@ -14,6 +14,7 @@ pub struct Candidate {
     pub created: SystemTime,
     pub stable_since: Option<SystemTime>,
     pub attempts: u32,
+    pub last_error_at: Option<SystemTime>,
     pub poisoned: bool,
     pub settle_secs: u64,
 }
@@ -91,6 +92,15 @@ pub fn upsert(
     }
 }
 
+pub fn clear_poisoned(table: &mut HashMap<PathBuf, Candidate>, source: Option<&str>) {
+    for c in table.values_mut() {
+        if source.is_some_and(|id| c.source_id != id) {
+            continue;
+        }
+        c.poisoned = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +116,7 @@ mod tests {
             created: UNIX_EPOCH,
             stable_since: ready.then_some(UNIX_EPOCH),
             attempts: 0,
+            last_error_at: None,
             poisoned: false,
             settle_secs: 0,
         }
@@ -181,5 +192,30 @@ mod tests {
         assert_eq!(table.len(), 1);
         assert_eq!(table[&path].attempts, 0);
         assert_eq!(table[&path].first_seen, UNIX_EPOCH + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn rescan_clears_poisoned_for_source() {
+        let mut table = HashMap::new();
+        let now = UNIX_EPOCH;
+        upsert(&mut table, PathBuf::from("/dl/a"), cand(1, true), 8, now);
+        upsert(
+            &mut table,
+            PathBuf::from("/ss/b"),
+            {
+                let mut c = cand(2, true);
+                c.source_id = "screenshots".into();
+                c.poisoned = true;
+                c
+            },
+            8,
+            now,
+        );
+        table.get_mut(&PathBuf::from("/dl/a")).unwrap().poisoned = true;
+        clear_poisoned(&mut table, Some("downloads"));
+        assert!(!table[&PathBuf::from("/dl/a")].poisoned);
+        assert!(table[&PathBuf::from("/ss/b")].poisoned);
+        clear_poisoned(&mut table, None);
+        assert!(!table[&PathBuf::from("/ss/b")].poisoned);
     }
 }

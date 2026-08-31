@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::candidate::{upsert, Upsert};
+use crate::candidate::{clear_poisoned, upsert, Upsert};
 use crate::config::{Config, SourceConfig};
 use crate::known_folders::{canonical_key, deny_source, is_same_or_inside, KnownFolders};
 use crate::paths::Paths;
@@ -281,6 +281,7 @@ pub fn admit(
         created: info.created,
         stable_since: None,
         attempts: 0,
+        last_error_at: None,
         poisoned: false,
         settle_secs: source.settle_secs,
     })
@@ -505,6 +506,10 @@ impl WatchRuntime {
         include_existing: bool,
         min_age_override: Option<Duration>,
     ) {
+        {
+            let mut table = self.candidates.lock().unwrap_or_else(|e| e.into_inner());
+            clear_poisoned(&mut table, source);
+        }
         for i in 0..self.sources.len() {
             if source.is_some_and(|id| self.sources[i].cfg.id != id) {
                 continue;

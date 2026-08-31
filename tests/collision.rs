@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use weekcase::classify::{Bucket, FileSnapshot, Placement};
@@ -145,6 +146,7 @@ fn skip_leaves_source_and_records_skipped() {
         &snap(from.clone(), 6),
         &placement(dest_dir.clone(), "foo.pdf"),
         &dir.join("undo.jsonl"),
+        &Mutex::new(AppState::default()),
         &dir.join("state.json"),
     )
     .unwrap_err();
@@ -170,6 +172,7 @@ fn undo_does_not_overwrite_existing_source() {
         &snap(from.clone(), 5),
         &placement(dest_dir.clone(), "a.pdf"),
         &undo,
+        &Mutex::new(AppState::default()),
         &dir.join("state.json"),
     )
     .unwrap();

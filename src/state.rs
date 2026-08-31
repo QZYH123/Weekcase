@@ -64,6 +64,10 @@ impl AppState {
         self.skipped.iter().any(|p| p == path)
     }
 
+    pub fn remove_blocked_from(&mut self, from: &Path) {
+        self.blocked.retain(|b| !same_path(&b.from, from));
+    }
+
     pub fn push_blocked(&mut self, from: PathBuf, to: PathBuf) {
         self.blocked.retain(|b| !same_path(&b.from, &from));
         if self.blocked.len() >= MAX_BLOCKED {

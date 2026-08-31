@@ -16,6 +16,7 @@ use crate::watch::{inspect_file, is_ignored, FileInfo, IgnoreSet};
 const ZERO_BYTE_MIN_AGE: Duration = Duration::from_secs(60);
 const ERROR_EVERY: Duration = Duration::from_secs(60);
 const MAX_ATTEMPTS: u32 = 5;
+const RETRY_BACKOFF_SECS: &[u64] = &[5, 15, 60];
 
 #[allow(clippy::too_many_arguments)]
 pub fn start_stabilize(
@@ -36,9 +37,19 @@ pub fn start_stabilize(
             let mut logged = HashSet::new();
             let mut limiter = LogLimiter::default();
             let mut illegal_warned = HashSet::new();
+            let mut persist_retry = false;
             while !shutdown.load(Ordering::Relaxed) {
+                flush_persist(&state, &state_path, &mut persist_retry);
                 let paused_now = paused.load(Ordering::Relaxed);
-                let ready = tick_once(&candidates, &ignore, SystemTime::now(), paused_now);
+                let ready = tick_once_with(
+                    &candidates,
+                    &ignore,
+                    SystemTime::now(),
+                    paused_now,
+                    Some(&state),
+                    Some(&mut persist_retry),
+                );
+                flush_persist(&state, &state_path, &mut persist_retry);
                 for snap in take_new_ready(&ready, &mut logged) {
                     tracing::info!(
                         path = %snap.path.display(),
@@ -56,7 +67,13 @@ pub fn start_stabilize(
                         undo_path: &undo_path,
                         state_path: &state_path,
                     };
-                    execute_ready(&ctx, &ready, &mut limiter, &mut illegal_warned);
+                    execute_ready(
+                        &ctx,
+                        &ready,
+                        &mut limiter,
+                        &mut illegal_warned,
+                        &mut persist_retry,
+                    );
                 }
                 thread::sleep(tick);
             }
@@ -70,28 +87,78 @@ pub fn tick_once(
     now: SystemTime,
     paused: bool,
 ) -> Vec<FileSnapshot> {
-    let mut table = candidates.lock().unwrap_or_else(|e| e.into_inner());
-    let paths: Vec<PathBuf> = table.keys().cloned().collect();
-    let mut drop_list = Vec::new();
-    let mut ready = Vec::new();
+    tick_once_with(candidates, ignore, now, paused, None, None)
+}
 
-    for path in paths {
-        let Some(cand) = table.get(&path) else {
-            continue;
-        };
-        if cand.poisoned {
-            continue;
-        }
-        match inspect_file(&path) {
-            Ok(info) if should_keep(&path, &info, ignore) => {
-                sample(&mut table, &path, &info, now, paused, &mut ready);
+fn tick_once_with(
+    candidates: &Mutex<HashMap<PathBuf, Candidate>>,
+    ignore: &IgnoreSet,
+    now: SystemTime,
+    paused: bool,
+    live: Option<&Mutex<AppState>>,
+    persist_retry: Option<&mut bool>,
+) -> Vec<FileSnapshot> {
+    let blocked: Vec<(PathBuf, PathBuf)> = live
+        .map(|s| {
+            s.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .blocked
+                .iter()
+                .map(|b| (b.from.clone(), b.to.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut unblocked = Vec::new();
+    let ready = {
+        let mut table = candidates.lock().unwrap_or_else(|e| e.into_inner());
+        let paths: Vec<PathBuf> = table.keys().cloned().collect();
+        let mut drop_list = Vec::new();
+        let mut ready = Vec::new();
+
+        for path in paths {
+            let Some(cand) = table.get(&path) else {
+                continue;
+            };
+            let poisoned = cand.poisoned;
+            match inspect_file(&path) {
+                Ok(info) if should_keep(&path, &info, ignore) => {
+                    if poisoned {
+                        let dest = blocked
+                            .iter()
+                            .find(|(from, _)| crate::state::same_path(from, &path))
+                            .map(|(_, to)| to);
+                        if dest.is_some_and(|to| !to.exists()) {
+                            if let Some(c) = table.get_mut(&path) {
+                                c.poisoned = false;
+                            }
+                            unblocked.push(path.clone());
+                            sample(&mut table, &path, &info, now, paused, &mut ready);
+                        }
+                        continue;
+                    }
+                    sample(&mut table, &path, &info, now, paused, &mut ready);
+                }
+                _ => drop_list.push(path),
             }
-            _ => drop_list.push(path),
         }
-    }
 
-    for path in drop_list {
-        table.remove(&path);
+        for path in drop_list {
+            table.remove(&path);
+        }
+        ready
+    };
+
+    if !unblocked.is_empty() {
+        if let Some(live) = live {
+            let mut state = live.lock().unwrap_or_else(|e| e.into_inner());
+            for path in &unblocked {
+                state.remove_blocked_from(path);
+            }
+        }
+        if let Some(retry) = persist_retry {
+            *retry = true;
+        }
     }
     ready
 }
@@ -129,14 +196,44 @@ fn sample(
     if !lock_probe_ok(path) {
         return;
     }
-    cand.attempts = 0;
     if cand.stable_since.is_none() {
         cand.stable_since = Some(now);
+    }
+    if cand.attempts > 0 && !backoff_elapsed(cand, now) {
+        return;
+    }
+    if cand.attempts >= MAX_ATTEMPTS {
+        cand.attempts = 0;
+        cand.last_error_at = None;
     }
     if paused || !cand.is_ready(now) {
         return;
     }
     ready.push(cand.snapshot(path.to_path_buf()));
+}
+
+fn retry_backoff(attempts: u32) -> Duration {
+    let i = attempts.saturating_sub(1) as usize;
+    Duration::from_secs(*RETRY_BACKOFF_SECS.get(i).unwrap_or(&60))
+}
+
+fn backoff_elapsed(cand: &Candidate, now: SystemTime) -> bool {
+    let Some(at) = cand.last_error_at else {
+        return true;
+    };
+    now.duration_since(at)
+        .map(|d| d >= retry_backoff(cand.attempts))
+        .unwrap_or(true)
+}
+
+fn flush_persist(live: &Mutex<AppState>, path: &Path, retry: &mut bool) {
+    if !*retry {
+        return;
+    }
+    match live.lock().unwrap_or_else(|e| e.into_inner()).save(path) {
+        Ok(()) => *retry = false,
+        Err(err) => tracing::error!(error = %err, "persist blocked failed"),
+    }
 }
 
 fn take_new_ready<'a>(
@@ -196,20 +293,33 @@ fn execute_ready(
     ready: &[FileSnapshot],
     limiter: &mut LogLimiter,
     illegal_warned: &mut HashSet<PathBuf>,
+    persist_retry: &mut bool,
 ) {
     for snap in ready {
         // classify + Move run with no candidate lock (T1 may upsert during a cross-volume copy).
         let outcome = match classify(ctx.cfg, snap, ctx.folders) {
             Err(err) => Outcome::Classify(err),
-            Ok(placement) => {
-                match execute_move(ctx.cfg, snap, &placement, ctx.undo_path, ctx.state_path) {
-                    Ok(_) => Outcome::Moved,
-                    Err(err) => Outcome::Exec(err),
-                }
-            }
+            Ok(placement) => match execute_move(
+                ctx.cfg,
+                snap,
+                &placement,
+                ctx.undo_path,
+                ctx.live,
+                ctx.state_path,
+            ) {
+                Ok(_) => Outcome::Moved,
+                Err(err) => Outcome::Exec(err),
+            },
         };
         if matches!(
-            apply_outcome(ctx, &snap.path, outcome, limiter, illegal_warned),
+            apply_outcome(
+                ctx,
+                &snap.path,
+                outcome,
+                limiter,
+                illegal_warned,
+                persist_retry
+            ),
             Next::Stop
         ) {
             break;
@@ -223,6 +333,7 @@ fn apply_outcome(
     outcome: Outcome,
     limiter: &mut LogLimiter,
     illegal_warned: &mut HashSet<PathBuf>,
+    persist_retry: &mut bool,
 ) -> Next {
     match outcome {
         Outcome::Moved => {
@@ -258,8 +369,21 @@ fn apply_outcome(
             remove_candidate(ctx.candidates, path);
             Next::Continue
         }
-        Outcome::Exec(ExecError::SplitCopy)
-        | Outcome::Exec(ExecError::Blocked)
+        Outcome::Exec(ExecError::SplitCopy { to }) => {
+            {
+                let mut live = ctx.live.lock().unwrap_or_else(|e| e.into_inner());
+                live.push_blocked(path.to_path_buf(), to);
+                if live.save(ctx.state_path).is_err() {
+                    *persist_retry = true;
+                }
+            }
+            if limiter.allow("exec_poison") {
+                tracing::error!(path = %path.display(), "move poisoned");
+            }
+            poison_candidate(ctx.candidates, path);
+            Next::Continue
+        }
+        Outcome::Exec(ExecError::Blocked)
         | Outcome::Exec(ExecError::SamePath)
         | Outcome::Exec(ExecError::CollisionLimit) => {
             if limiter.allow("exec_poison") {
@@ -278,7 +402,7 @@ fn apply_outcome(
         | Outcome::Exec(ExecError::AccessDenied)
         | Outcome::Exec(ExecError::CopyLeftSource)
         | Outcome::Exec(ExecError::Io(_)) => {
-            let attempts = bump_attempts(ctx.candidates, path);
+            let attempts = bump_attempts(ctx.candidates, path, SystemTime::now());
             if attempts >= MAX_ATTEMPTS && limiter.allow("exec_retry") {
                 tracing::error!(path = %path.display(), attempts, "move failed");
             }
@@ -301,11 +425,12 @@ fn poison_candidate(table: &Mutex<HashMap<PathBuf, Candidate>>, path: &Path) {
     }
 }
 
-fn bump_attempts(table: &Mutex<HashMap<PathBuf, Candidate>>, path: &Path) -> u32 {
+fn bump_attempts(table: &Mutex<HashMap<PathBuf, Candidate>>, path: &Path, now: SystemTime) -> u32 {
     let mut table = table.lock().unwrap_or_else(|e| e.into_inner());
     match table.get_mut(path) {
         Some(cand) => {
             cand.attempts = cand.attempts.saturating_add(1);
+            cand.last_error_at = Some(now);
             cand.attempts
         }
         None => 0,
@@ -406,6 +531,7 @@ mod tests {
             created: info.created,
             stable_since: None,
             attempts: 0,
+            last_error_at: None,
             poisoned: false,
             settle_secs,
         }
@@ -421,6 +547,7 @@ mod tests {
             created: UNIX_EPOCH,
             stable_since: Some(UNIX_EPOCH),
             attempts: 0,
+            last_error_at: None,
             poisoned: false,
             settle_secs: 0,
         }
@@ -473,7 +600,8 @@ mod tests {
         };
         let mut limiter = LogLimiter::default();
         let mut illegal = HashSet::new();
-        execute_ready(&ctx, ready, &mut limiter, &mut illegal);
+        let mut persist_retry = false;
+        execute_ready(&ctx, ready, &mut limiter, &mut illegal, &mut persist_retry);
     }
 
     fn apply(
@@ -497,7 +625,15 @@ mod tests {
         };
         let mut limiter = LogLimiter::default();
         let mut illegal = HashSet::new();
-        apply_outcome(&ctx, path, outcome, &mut limiter, &mut illegal)
+        let mut persist_retry = false;
+        apply_outcome(
+            &ctx,
+            path,
+            outcome,
+            &mut limiter,
+            &mut illegal,
+            &mut persist_retry,
+        )
     }
 
     #[test]
@@ -592,14 +728,47 @@ mod tests {
     }
 
     #[test]
-    fn lock_probe_success_zeros_attempts() {
+    fn execute_failure_backoff_skips_ready() {
         let dir = temp_dir();
         let (path, info) = insert_file(&dir, "a.pdf", b"x");
         let mut cand = candidate(&info, 0);
-        cand.attempts = 4;
+        cand.attempts = 1;
+        cand.last_error_at = Some(SystemTime::now());
         cand.stable_since = Some(UNIX_EPOCH);
         let table = Mutex::new(HashMap::from([(path.clone(), cand)]));
         let ready = tick_once(&table, &ignore(), SystemTime::now(), false);
+        assert!(ready.is_empty());
+        assert_eq!(table.lock().unwrap()[&path].attempts, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backoff_elapsed_keeps_attempts_under_cap() {
+        let dir = temp_dir();
+        let (path, info) = insert_file(&dir, "a.pdf", b"x");
+        let now = SystemTime::now();
+        let mut cand = candidate(&info, 0);
+        cand.attempts = 2;
+        cand.last_error_at = Some(now - Duration::from_secs(16));
+        cand.stable_since = Some(UNIX_EPOCH);
+        let table = Mutex::new(HashMap::from([(path.clone(), cand)]));
+        let ready = tick_once(&table, &ignore(), now, false);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(table.lock().unwrap()[&path].attempts, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attempts_cap_zeros_after_backoff() {
+        let dir = temp_dir();
+        let (path, info) = insert_file(&dir, "a.pdf", b"x");
+        let now = SystemTime::now();
+        let mut cand = candidate(&info, 0);
+        cand.attempts = MAX_ATTEMPTS;
+        cand.last_error_at = Some(now - Duration::from_secs(61));
+        cand.stable_since = Some(UNIX_EPOCH);
+        let table = Mutex::new(HashMap::from([(path.clone(), cand)]));
+        let ready = tick_once(&table, &ignore(), now, false);
         assert_eq!(ready.len(), 1);
         assert_eq!(table.lock().unwrap()[&path].attempts, 0);
         let _ = fs::remove_dir_all(&dir);
@@ -684,7 +853,27 @@ mod tests {
         assert!(matches!(next, Next::Continue));
         let t = table.lock().unwrap();
         assert_eq!(t[&path].attempts, 1);
+        assert!(t[&path].last_error_at.is_some());
         assert!(!t[&path].poisoned);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fifth_sharing_reaches_max_attempts() {
+        let dir = temp_dir();
+        let path = PathBuf::from(r"C:\Users\a\Downloads\a.pdf");
+        let table = Mutex::new(HashMap::from([(path.clone(), cand_ready())]));
+        let live = Mutex::new(AppState::default());
+        for n in 1..=MAX_ATTEMPTS {
+            apply(
+                &table,
+                &live,
+                &dir,
+                &path,
+                Outcome::Exec(ExecError::SharingViolation),
+            );
+            assert_eq!(table.lock().unwrap()[&path].attempts, n);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -730,14 +919,73 @@ mod tests {
         let path = PathBuf::from(r"C:\Users\a\Downloads\a.pdf");
         let table = Mutex::new(HashMap::from([(path.clone(), cand_ready())]));
         let live = Mutex::new(AppState::default());
+        let dest = PathBuf::from(r"C:\out\a.pdf");
         apply(
             &table,
             &live,
             &dir,
             &path,
-            Outcome::Exec(ExecError::SplitCopy),
+            Outcome::Exec(ExecError::SplitCopy { to: dest.clone() }),
         );
         assert!(table.lock().unwrap()[&path].poisoned);
+        let st = live.lock().unwrap();
+        assert!(st.is_blocked_from(&path));
+        assert_eq!(st.blocked[0].to, dest);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poisoned_missing_is_dropped() {
+        let dir = temp_dir();
+        let missing = dir.join("gone.pdf");
+        let mut cand = cand_ready();
+        cand.poisoned = true;
+        let table = Mutex::new(HashMap::from([(missing, cand)]));
+        let ready = tick_once(&table, &ignore(), SystemTime::now(), false);
+        assert!(ready.is_empty());
+        assert!(table.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dest_gone_unpoisons_blocked() {
+        let dir = temp_dir();
+        let (path, info) = insert_file(&dir, "a.pdf", b"x");
+        let dest = dir.join("leftover.bin");
+        fs::write(&dest, b"copy").unwrap();
+        let mut cand = candidate(&info, 0);
+        cand.poisoned = true;
+        cand.stable_since = Some(UNIX_EPOCH);
+        let table = Mutex::new(HashMap::from([(path.clone(), cand)]));
+        let live = Mutex::new(AppState::default());
+        live.lock()
+            .unwrap()
+            .push_blocked(path.clone(), dest.clone());
+        let ready = tick_once_with(
+            &table,
+            &ignore(),
+            SystemTime::now(),
+            false,
+            Some(&live),
+            None,
+        );
+        assert!(ready.is_empty());
+        assert!(table.lock().unwrap()[&path].poisoned);
+
+        fs::remove_file(&dest).unwrap();
+        let mut persist_retry = false;
+        let ready = tick_once_with(
+            &table,
+            &ignore(),
+            SystemTime::now(),
+            false,
+            Some(&live),
+            Some(&mut persist_retry),
+        );
+        assert_eq!(ready.len(), 1);
+        assert!(!table.lock().unwrap()[&path].poisoned);
+        assert!(!live.lock().unwrap().is_blocked_from(&path));
+        assert!(persist_retry);
         let _ = fs::remove_dir_all(&dir);
     }
 

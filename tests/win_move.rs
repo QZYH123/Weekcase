@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use weekcase::classify::{Bucket, FileSnapshot, Placement};
@@ -65,6 +66,7 @@ fn move_creates_dest_dir_and_leaves_source_empty() {
         &snap(from.clone(), 5),
         &placement(dest_dir.clone(), "a.pdf"),
         &dir.join("undo.jsonl"),
+        &Mutex::new(AppState::default()),
         &dir.join("state.json"),
     )
     .unwrap();
@@ -94,6 +96,7 @@ fn collision_suffix_does_not_replace_existing() {
         &snap(from.clone(), 3),
         &placement(dest_dir.clone(), "foo.pdf"),
         &dir.join("undo.jsonl"),
+        &Mutex::new(AppState::default()),
         &dir.join("state.json"),
     )
     .unwrap();
@@ -123,6 +126,7 @@ fn skip_leaves_source_and_does_not_write_undo() {
         &snap(from.clone(), 6),
         &placement(dest_dir, "foo.pdf"),
         &dir.join("undo.jsonl"),
+        &Mutex::new(AppState::default()),
         &dir.join("state.json"),
     )
     .unwrap_err();
@@ -149,6 +153,7 @@ fn undo_last_moves_back_and_is_not_repeatable() {
         &snap(from.clone(), 5),
         &placement(dest_dir.clone(), "a.pdf"),
         &undo,
+        &Mutex::new(AppState::default()),
         &dir.join("state.json"),
     )
     .unwrap();
@@ -181,6 +186,7 @@ fn undo_does_not_overwrite_existing_source() {
         &snap(from.clone(), 5),
         &placement(dest_dir.clone(), "a.pdf"),
         &undo,
+        &Mutex::new(AppState::default()),
         &dir.join("state.json"),
     )
     .unwrap();
@@ -206,6 +212,7 @@ fn same_path_is_rejected() {
         &snap(from.clone(), 1),
         &placement(dir.clone(), "a.pdf"),
         &dir.join("undo.jsonl"),
+        &Mutex::new(AppState::default()),
         &dir.join("state.json"),
     )
     .unwrap_err();
@@ -228,6 +235,7 @@ fn zone_identifier_survives_same_volume_move() {
         &snap(from.clone(), 4),
         &placement(dest_dir.clone(), "z.pdf"),
         &dir.join("undo.jsonl"),
+        &Mutex::new(AppState::default()),
         &dir.join("state.json"),
     )
     .unwrap();

@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::classify::{FileSnapshot, Placement};
 use crate::config::{Collision, Config};
@@ -23,7 +24,7 @@ pub enum ExecError {
     DiskFull,
     AccessDenied,
     CopyLeftSource,
-    SplitCopy,
+    SplitCopy { to: PathBuf },
     Io(io::Error),
 }
 
@@ -78,15 +79,18 @@ pub fn execute_move(
     snap: &FileSnapshot,
     placement: &Placement,
     undo_path: &Path,
+    live: &Mutex<AppState>,
     state_path: &Path,
 ) -> Result<JournalRecord, ExecError> {
     let unsuffixed = placement.dest_dir.join(&placement.dest_name);
     if same_path(&snap.path, &unsuffixed) {
         return Err(ExecError::SamePath);
     }
-    let state = AppState::load(state_path)?;
-    if state.is_blocked_from(&snap.path) {
-        return Err(ExecError::Blocked);
+    {
+        let state = live.lock().unwrap_or_else(|e| e.into_inner());
+        if state.is_blocked_from(&snap.path) {
+            return Err(ExecError::Blocked);
+        }
     }
 
     fs::create_dir_all(&placement.dest_dir)?;
@@ -94,11 +98,11 @@ pub fn execute_move(
     if cfg.destination.collision == Collision::Skip {
         let dest = placement.dest_dir.join(&placement.dest_name);
         if path_exists(&dest) {
-            return skip_collision(state_path, snap.path.clone());
+            return skip_collision(live, state_path, snap.path.clone());
         }
-        return match try_move(snap, &dest, undo_path, state_path) {
+        return match try_move(snap, &dest, undo_path, live, state_path) {
             Err(ExecError::Io(e)) if is_dest_occupied(&e) => {
-                skip_collision(state_path, snap.path.clone())
+                skip_collision(live, state_path, snap.path.clone())
             }
             other => other,
         };
@@ -111,7 +115,7 @@ pub fn execute_move(
         if path_exists(&dest) {
             continue;
         }
-        match try_move(snap, &dest, undo_path, state_path) {
+        match try_move(snap, &dest, undo_path, live, state_path) {
             Err(ExecError::Io(e)) if is_dest_occupied(&e) => continue,
             other => return other,
         }
@@ -145,11 +149,12 @@ fn try_move(
     snap: &FileSnapshot,
     dest: &Path,
     undo_path: &Path,
+    live: &Mutex<AppState>,
     state_path: &Path,
 ) -> Result<JournalRecord, ExecError> {
     let from = snap.path.as_path();
     let move_result = move_file(from, dest, true);
-    settle_after_move(from, dest, move_result, state_path)?;
+    settle_after_move(from, dest, move_result, live, state_path)?;
     if let Some(size) = file_size(dest) {
         if size != snap.size {
             tracing::error!(
@@ -179,6 +184,7 @@ fn settle_after_move(
     from: &Path,
     to: &Path,
     move_result: io::Result<()>,
+    live: &Mutex<AppState>,
     state_path: &Path,
 ) -> Result<(), ExecError> {
     let from_ex = path_exists(from);
@@ -186,7 +192,7 @@ fn settle_after_move(
     match move_result {
         Ok(()) => {
             if from_ex && to_ex {
-                return handle_split(from, to, state_path);
+                return handle_split(from, to, live, state_path);
             }
             if to_ex && !from_ex {
                 return Ok(());
@@ -204,7 +210,7 @@ fn settle_after_move(
                 return Ok(());
             }
             if to_ex && from_ex {
-                return handle_split(from, to, state_path);
+                return handle_split(from, to, live, state_path);
             }
             Err(map_move_err(e))
         }
@@ -254,7 +260,12 @@ fn finalize_undo(from: &Path, to: &Path, from_ex: bool, to_ex: bool) -> Result<(
     }
 }
 
-fn handle_split(from: &Path, to: &Path, state_path: &Path) -> Result<(), ExecError> {
+fn handle_split(
+    from: &Path,
+    to: &Path,
+    live: &Mutex<AppState>,
+    state_path: &Path,
+) -> Result<(), ExecError> {
     match delete_file(to) {
         Ok(()) => {
             tracing::error!(
@@ -271,7 +282,9 @@ fn handle_split(from: &Path, to: &Path, state_path: &Path) -> Result<(), ExecErr
                 error = %e,
                 "split copy; blocked"
             );
-            if let Err(err) = persist_blocked(state_path, from.to_path_buf(), to.to_path_buf()) {
+            if let Err(err) =
+                persist_blocked(live, state_path, from.to_path_buf(), to.to_path_buf())
+            {
                 tracing::error!(
                     from = %from.display(),
                     to = %to.display(),
@@ -279,25 +292,36 @@ fn handle_split(from: &Path, to: &Path, state_path: &Path) -> Result<(), ExecErr
                     "persist blocked failed"
                 );
             }
-            Err(ExecError::SplitCopy)
+            Err(ExecError::SplitCopy {
+                to: to.to_path_buf(),
+            })
         }
     }
 }
 
-fn skip_collision(state_path: &Path, path: PathBuf) -> Result<JournalRecord, ExecError> {
-    persist_skipped(state_path, path.clone())?;
+fn skip_collision(
+    live: &Mutex<AppState>,
+    state_path: &Path,
+    path: PathBuf,
+) -> Result<JournalRecord, ExecError> {
+    persist_skipped(live, state_path, path.clone())?;
     tracing::info!(path = %path.display(), "skipped collision");
     Err(ExecError::Skipped)
 }
 
-fn persist_skipped(state_path: &Path, path: PathBuf) -> io::Result<()> {
-    let mut state = AppState::load(state_path)?;
+fn persist_skipped(live: &Mutex<AppState>, state_path: &Path, path: PathBuf) -> io::Result<()> {
+    let mut state = live.lock().unwrap_or_else(|e| e.into_inner());
     state.push_skipped(path);
     state.save(state_path)
 }
 
-fn persist_blocked(state_path: &Path, from: PathBuf, to: PathBuf) -> io::Result<()> {
-    let mut state = AppState::load(state_path)?;
+fn persist_blocked(
+    live: &Mutex<AppState>,
+    state_path: &Path,
+    from: PathBuf,
+    to: PathBuf,
+) -> io::Result<()> {
+    let mut state = live.lock().unwrap_or_else(|e| e.into_inner());
     state.push_blocked(from, to);
     state.save(state_path)
 }
@@ -566,6 +590,10 @@ mod tests {
         }
     }
 
+    fn live() -> Mutex<AppState> {
+        Mutex::new(AppState::default())
+    }
+
     #[test]
     fn split_copy_deletes_dest_when_source_remains() {
         let dir = temp_dir();
@@ -574,12 +602,14 @@ mod tests {
         fs::write(&from, b"abc").unwrap();
         fs::write(&to, b"abc").unwrap();
         let state_path = dir.join("state.json");
-        let err = handle_split(&from, &to, &state_path).unwrap_err();
+        let live = live();
+        let err = handle_split(&from, &to, &live, &state_path).unwrap_err();
         assert!(matches!(err, ExecError::CopyLeftSource));
         assert!(from.exists());
         assert!(!to.exists());
-        let state = AppState::load(&state_path).unwrap();
+        let state = AppState::load(&state_path).unwrap_or_default();
         assert!(!state.is_blocked_from(&from));
+        assert!(!live.lock().unwrap().is_blocked_from(&from));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -591,13 +621,55 @@ mod tests {
         fs::write(&from, b"abc").unwrap();
         fs::create_dir(&to).unwrap();
         let state_path = dir.join("state.json");
-        let err = handle_split(&from, &to, &state_path).unwrap_err();
-        assert!(matches!(err, ExecError::SplitCopy));
+        let live = live();
+        let err = handle_split(&from, &to, &live, &state_path).unwrap_err();
+        match err {
+            ExecError::SplitCopy { to: dest } => assert_eq!(dest, to),
+            other => panic!("{other:?}"),
+        }
         assert!(from.exists());
         assert!(to.exists());
         let state = AppState::load(&state_path).unwrap();
         assert!(state.is_blocked_from(&from));
         assert_eq!(state.blocked[0].to, to);
+        assert!(live.lock().unwrap().is_blocked_from(&from));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_fail_split_copy_cannot_suffix() {
+        let dir = temp_dir();
+        let from = dir.join("from.bin");
+        let leftover = dir.join("to_dir");
+        fs::write(&from, b"abc").unwrap();
+        fs::create_dir(&leftover).unwrap();
+        let state_path = dir.join("state.json");
+        fs::create_dir(&state_path).unwrap();
+        let live = live();
+        let err = handle_split(&from, &leftover, &live, &state_path).unwrap_err();
+        match err {
+            ExecError::SplitCopy { to } => assert_eq!(to, leftover),
+            other => panic!("{other:?}"),
+        }
+        assert!(live.lock().unwrap().is_blocked_from(&from));
+        assert!(AppState::load(&state_path).is_err());
+
+        let dest_dir = dir.join("out");
+        fs::create_dir_all(&dest_dir).unwrap();
+        fs::write(dest_dir.join("from.bin"), b"old").unwrap();
+        let err = execute_move(
+            &Config::default(),
+            &snap_at(from.clone(), 3),
+            &place(dest_dir.clone(), "from.bin"),
+            &dir.join("undo.jsonl"),
+            &live,
+            &state_path,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecError::Blocked));
+        assert!(from.exists());
+        assert!(!dest_dir.join("from-1.bin").exists());
+        assert_eq!(fs::read(dest_dir.join("from.bin")).unwrap(), b"old");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -612,6 +684,7 @@ mod tests {
         let mut state = AppState::default();
         state.push_blocked(from.clone(), dest_dir.join("a.pdf"));
         state.save(&state_path).unwrap();
+        let live = Mutex::new(state);
 
         let cfg = Config::default();
         let snap = snap_at(from.clone(), 4);
@@ -620,6 +693,7 @@ mod tests {
             &snap,
             &place(dest_dir.clone(), "a.pdf"),
             &dir.join("undo.jsonl"),
+            &live,
             &state_path,
         )
         .unwrap_err();
@@ -642,6 +716,7 @@ mod tests {
             &snap_at(from.clone(), 5),
             &place(dest_dir.clone(), "a.pdf"),
             &undo,
+            &live(),
             &dir.join("state.json"),
         )
         .unwrap();
@@ -673,6 +748,7 @@ mod tests {
             &snap_at(from.clone(), 3),
             &place(dest_dir.clone(), "foo.pdf"),
             &dir.join("undo.jsonl"),
+            &live(),
             &dir.join("state.json"),
         )
         .unwrap();
@@ -695,6 +771,7 @@ mod tests {
             &snap_at(from.clone(), 5),
             &place(dest_dir.clone(), "a.pdf"),
             &undo,
+            &live(),
             &dir.join("state.json"),
         )
         .unwrap();
@@ -749,11 +826,13 @@ mod tests {
         state.push_blocked(alt, dest_dir.join("a.pdf"));
         let state_path = dir.join("state.json");
         state.save(&state_path).unwrap();
+        let live = Mutex::new(AppState::load(&state_path).unwrap());
         let err = execute_move(
             &Config::default(),
             &snap_at(from.clone(), 4),
             &place(dest_dir.clone(), "a.pdf"),
             &dir.join("undo.jsonl"),
+            &live,
             &state_path,
         )
         .unwrap_err();
@@ -775,6 +854,7 @@ mod tests {
             &snap_at(from.clone(), 5),
             &place(dest_dir.clone(), "a.pdf"),
             &undo,
+            &live(),
             &dir.join("state.json"),
         )
         .unwrap();
