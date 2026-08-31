@@ -40,17 +40,17 @@ New-Item -ItemType Directory -Path $stage | Out-Null
 
 Copy-Item -LiteralPath $ExePath -Destination (Join-Path $stage 'weekcase.exe')
 
-$ini = @"
-; Weekcase portable mode
-; Put this file next to weekcase.exe. Presence enables:
-;   .\data\config.toml
-;   .\data\state.json
-;   .\data\undo.jsonl
-;   .\data\logs\weekcase.log
-; Contents of this file are ignored.
-; Uninstalling the app does not delete archived files under the archive root.
-"@
-[System.IO.File]::WriteAllText((Join-Path $stage 'portable.ini'), $ini.TrimStart() + "`r`n")
+# ASCII so Windows PowerShell 5.1 and pwsh write the same bytes (no BOM).
+Set-Content -LiteralPath (Join-Path $stage 'portable.ini') -Encoding Ascii -Value @(
+    '; Weekcase portable mode'
+    '; Put this file next to weekcase.exe. Presence enables:'
+    ';   .\data\config.toml'
+    ';   .\data\state.json'
+    ';   .\data\undo.jsonl'
+    ';   .\data\logs\weekcase.log'
+    '; Contents of this file are ignored.'
+    '; Uninstalling the app does not delete archived files under the archive root.'
+)
 
 $zip = Join-Path $OutDir 'weekcase-portable.zip'
 if (Test-Path -LiteralPath $zip) {
