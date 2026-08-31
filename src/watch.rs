@@ -107,11 +107,12 @@ pub fn start_watch(
     cfg: Arc<Config>,
     state: Arc<Mutex<AppState>>,
     candidates: Arc<Mutex<HashMap<PathBuf, Candidate>>>,
+    folders: Arc<Mutex<KnownFolders>>,
     cmd: Receiver<WatchCmd>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("weekcase-watch".into())
-        .spawn(move || run_watch(cfg, state, candidates, cmd))
+        .spawn(move || run_watch(cfg, state, candidates, folders, cmd))
         .expect("watch thread")
 }
 
@@ -291,9 +292,9 @@ fn run_watch(
     cfg: Arc<Config>,
     state: Arc<Mutex<AppState>>,
     candidates: Arc<Mutex<HashMap<PathBuf, Candidate>>>,
+    folders: Arc<Mutex<KnownFolders>>,
     cmd: Receiver<WatchCmd>,
 ) {
-    let folders = KnownFolders::resolve();
     let ignore = IgnoreSet::from_process();
     let mut rt = WatchRuntime::new(cfg, state, candidates, cmd, folders, ignore);
     rt.boot();
@@ -303,7 +304,7 @@ fn run_watch(
 struct WatchRuntime {
     state: Arc<Mutex<AppState>>,
     candidates: Arc<Mutex<HashMap<PathBuf, Candidate>>>,
-    folders: KnownFolders,
+    folders: Arc<Mutex<KnownFolders>>,
     ignore: IgnoreSet,
     sources: Vec<SourceSlot>,
     pending: HashMap<PathBuf, (usize, Instant)>,
@@ -402,16 +403,17 @@ impl WatchRuntime {
         state: Arc<Mutex<AppState>>,
         candidates: Arc<Mutex<HashMap<PathBuf, Candidate>>>,
         cmd: Receiver<WatchCmd>,
-        folders: KnownFolders,
+        folders: Arc<Mutex<KnownFolders>>,
         ignore: IgnoreSet,
     ) -> Self {
+        let snapshot = folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let max_sources = cfg.watch.max_sources as usize;
         let mut sources = Vec::new();
         for src in cfg.sources.iter().filter(|s| s.enabled) {
             if sources.len() >= max_sources {
                 break;
             }
-            sources.push(SourceSlot::from_config(src, &folders));
+            sources.push(SourceSlot::from_config(src, &snapshot));
         }
         #[cfg(windows)]
         let buf_len = if cfg.watch.buffer_bytes == 0 {
@@ -675,7 +677,7 @@ impl WatchRuntime {
             self.begin_close(i, true);
             return;
         }
-        match prepare_source(&resolved, &self.folders) {
+        match prepare_source(&resolved, &self.folders_now()) {
             Ok(watch_path) => {
                 #[cfg(windows)]
                 {
@@ -717,12 +719,18 @@ impl WatchRuntime {
         }
     }
 
+    fn folders_now(&self) -> KnownFolders {
+        self.folders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn refresh_unresolved(&mut self, i: usize) {
         if self.sources[i].resolved.is_some() {
             return;
         }
-        self.folders = KnownFolders::resolve();
-        self.sources[i].resolved = self.sources[i].cfg.resolved_path(&self.folders);
+        apply_folders(&self.folders, &mut self.sources, KnownFolders::resolve());
     }
 
     fn schedule_retry(&mut self, i: usize, missing: bool) {
@@ -813,6 +821,15 @@ fn prepare_source(path: &Path, folders: &KnownFolders) -> Result<PathBuf, OpenEr
                 "source path normalize failed",
             ))
         })
+    }
+}
+
+fn apply_folders(shared: &Mutex<KnownFolders>, slots: &mut [SourceSlot], fresh: KnownFolders) {
+    *shared.lock().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
+    for slot in slots {
+        if slot.resolved.is_none() {
+            slot.resolved = slot.cfg.resolved_path(&fresh);
+        }
     }
 }
 
@@ -1724,5 +1741,25 @@ mod tests {
         let slot = SourceSlot::from_config(&SourceConfig::downloads(), &KnownFolders::default());
         assert!(!slot.dead);
         assert!(slot.resolved.is_none());
+    }
+
+    #[test]
+    fn retry_success_publishes_folders_for_classify() {
+        let shared = Mutex::new(KnownFolders::default());
+        let mut slots = vec![SourceSlot::from_config(
+            &SourceConfig::downloads(),
+            &KnownFolders::default(),
+        )];
+        let fresh = KnownFolders {
+            downloads: Some(PathBuf::from(r"C:\Users\a\Downloads")),
+            documents: Some(PathBuf::from(r"C:\Users\a\Documents")),
+            ..KnownFolders::default()
+        };
+        apply_folders(&shared, &mut slots, fresh.clone());
+        assert_eq!(slots[0].resolved, fresh.downloads);
+        assert_eq!(
+            shared.lock().unwrap_or_else(|e| e.into_inner()).documents,
+            fresh.documents
+        );
     }
 }

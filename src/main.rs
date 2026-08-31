@@ -87,6 +87,7 @@ fn run() -> io::Result<ExitCode> {
             Arc::new(cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()),
             Arc::clone(&state),
             Arc::clone(&candidates),
+            Arc::clone(&folders),
             cmd_rx,
         );
         let stab = stabilize::start_stabilize(

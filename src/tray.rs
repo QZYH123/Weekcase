@@ -567,8 +567,7 @@ mod win {
         }
 
         fn pick_root(&mut self) {
-            let folders = KnownFolders::resolve();
-            *folders_lock(&self.folders) = folders.clone();
+            let folders = live_folders(&self.folders);
             let current = cfg_lock(&self.cfg).resolved_root(&folders);
             let picked = match pick_directory(self.hwnd, current.as_deref()) {
                 Ok(Some(path)) => path,
@@ -611,7 +610,7 @@ mod win {
         }
 
         fn open_root(&mut self) {
-            let folders = folders_lock(&self.folders).clone();
+            let folders = live_folders(&self.folders);
             let Some(root) = cfg_lock(&self.cfg).resolved_root(&folders) else {
                 self.error("无法解析归档目录");
                 return;
@@ -692,6 +691,7 @@ mod win {
                 cfg,
                 Arc::clone(&self.state),
                 Arc::clone(&self.candidates),
+                Arc::clone(&self.folders),
                 rx,
             ));
         }
@@ -724,6 +724,7 @@ mod win {
                 cfg,
                 Arc::clone(&self.state),
                 Arc::clone(&self.candidates),
+                Arc::clone(&self.folders),
                 cmd_rx,
             ));
             self.stab = Some(crate::stabilize::start_stabilize(
@@ -804,6 +805,12 @@ mod win {
         fn confirm(&self, text: &str) -> bool {
             message_box(Some(self.hwnd), text, true)
         }
+    }
+
+    fn live_folders(shared: &Mutex<KnownFolders>) -> KnownFolders {
+        let folders = KnownFolders::resolve();
+        *folders_lock(shared) = folders.clone();
+        folders
     }
 
     fn copy_tip(dst: &mut [u16; 128], text: &str) {
