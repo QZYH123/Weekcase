@@ -24,7 +24,7 @@ pub const RDC_BUFFER_BYTES: u32 = 64 * 1024;
 pub const TICK_MS: u64 = 1_000;
 pub const DEBOUNCE_MS: u64 = 500;
 
-/// Default `config.toml` body. Unknown keys are ignored on load.
+/// On-disk template so comments survive; not serde-emitted.
 pub const DEFAULT_TOML: &str = r#"# Weekcase 默认配置。未知字段会被忽略。
 # v1 模板只认 {root} {bucket} {yyyy} {mm}，没有 {ww}。
 
@@ -246,6 +246,7 @@ impl Config {
     }
 }
 
+/// Unknown keys are ignored.
 pub fn parse(text: &str) -> Result<Config, toml::de::Error> {
     if text.trim().is_empty() {
         return Ok(Config::default());

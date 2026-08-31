@@ -265,10 +265,12 @@ fn known_folder(id: windows::core::GUID) -> Option<PathBuf> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY};
 
-    // SAFETY: `id` is a FOLDERID constant. DONT_VERIFY does not create the folder.
+    // DONT_VERIFY returns the path even if Screenshots is missing; it does not create it.
+    // SAFETY: `id` is a live FOLDERID GUID; None is the current-user token.
     let pwstr = unsafe { SHGetKnownFolderPath(&id, KF_FLAG_DONT_VERIFY, None) }.ok()?;
-    // SAFETY: SHGetKnownFolderPath returns a CoTaskMemAlloc'd NUL-terminated path.
+    // SAFETY: a successful call returns a CoTaskMemAlloc'd NUL-terminated PWSTR.
     let path = unsafe { pwstr.to_string() }.ok();
+    // SAFETY: `pwstr` came from that SHGetKnownFolderPath and is freed once.
     unsafe {
         CoTaskMemFree(Some(pwstr.0 as *const core::ffi::c_void));
     }

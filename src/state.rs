@@ -9,7 +9,7 @@ pub const STATE_VERSION: u32 = 1;
 pub const MAX_BLOCKED: usize = 64;
 pub const MAX_SKIPPED: usize = 256;
 
-/// `state.json`. Intentionally no watermark: young files stay on disk until min_age.
+/// Extra JSON keys (including `watermark`) are ignored and not written back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppState {
