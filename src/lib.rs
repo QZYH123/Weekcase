@@ -7,5 +7,6 @@ pub mod log_init;
 pub mod paths;
 pub mod stabilize;
 pub mod state;
+pub mod tray;
 pub mod undo;
 pub mod watch;

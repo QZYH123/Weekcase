@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -20,7 +20,7 @@ const RETRY_BACKOFF_SECS: &[u64] = &[5, 15, 60];
 
 #[allow(clippy::too_many_arguments)]
 pub fn start_stabilize(
-    cfg: Arc<Config>,
+    cfg: Arc<Mutex<Config>>,
     candidates: Arc<Mutex<HashMap<PathBuf, Candidate>>>,
     paused: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -28,12 +28,13 @@ pub fn start_stabilize(
     undo_path: PathBuf,
     state_path: PathBuf,
     state: Arc<Mutex<AppState>>,
+    archived_today: Arc<AtomicU32>,
 ) -> JoinHandle<()> {
     let ignore = IgnoreSet::from_process();
     thread::Builder::new()
         .name("weekcase-stab".into())
         .spawn(move || {
-            let tick = Duration::from_millis(cfg.watch.tick_ms.max(1));
+            let tick = Duration::from_millis(cfg_snapshot(&cfg).watch.tick_ms.max(1));
             let mut logged = HashSet::new();
             let mut limiter = LogLimiter::default();
             let mut illegal_warned = HashSet::new();
@@ -59,13 +60,15 @@ pub fn start_stabilize(
                     );
                 }
                 if !ready.is_empty() && !paused.load(Ordering::Relaxed) {
+                    let cfg_now = cfg_snapshot(&cfg);
                     let ctx = ReadyCtx {
-                        cfg: &cfg,
+                        cfg: &cfg_now,
                         folders: &folders,
                         candidates: &candidates,
                         live: &state,
                         undo_path: &undo_path,
                         state_path: &state_path,
+                        archived_today: &archived_today,
                     };
                     execute_ready(
                         &ctx,
@@ -79,6 +82,10 @@ pub fn start_stabilize(
             }
         })
         .expect("stabilize thread")
+}
+
+fn cfg_snapshot(cfg: &Mutex<Config>) -> Config {
+    cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 pub fn tick_once(
@@ -255,6 +262,7 @@ struct ReadyCtx<'a> {
     live: &'a Mutex<AppState>,
     undo_path: &'a Path,
     state_path: &'a Path,
+    archived_today: &'a AtomicU32,
 }
 
 enum Outcome {
@@ -337,6 +345,7 @@ fn apply_outcome(
 ) -> Next {
     match outcome {
         Outcome::Moved => {
+            ctx.archived_today.fetch_add(1, Ordering::Relaxed);
             remove_candidate(ctx.candidates, path);
             Next::Continue
         }
@@ -590,6 +599,7 @@ mod tests {
     ) {
         let undo = dir.join("undo.jsonl");
         let state_path = dir.join("state.json");
+        let archived_today = AtomicU32::new(0);
         let ctx = ReadyCtx {
             cfg,
             folders,
@@ -597,6 +607,7 @@ mod tests {
             live,
             undo_path: &undo,
             state_path: &state_path,
+            archived_today: &archived_today,
         };
         let mut limiter = LogLimiter::default();
         let mut illegal = HashSet::new();
@@ -615,6 +626,7 @@ mod tests {
         let folders = KnownFolders::default();
         let undo = dir.join("undo.jsonl");
         let state_path = dir.join("state.json");
+        let archived_today = AtomicU32::new(0);
         let ctx = ReadyCtx {
             cfg: &cfg,
             folders: &folders,
@@ -622,6 +634,7 @@ mod tests {
             live,
             undo_path: &undo,
             state_path: &state_path,
+            archived_today: &archived_today,
         };
         let mut limiter = LogLimiter::default();
         let mut illegal = HashSet::new();

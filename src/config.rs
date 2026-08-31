@@ -281,6 +281,110 @@ pub fn write_default_if_missing(path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Patch one key in an existing TOML file. Missing file is a no-op (`Ok(false)`).
+pub fn persist_kv(path: &Path, section: &str, key: &str, encoded: &str) -> io::Result<bool> {
+    let text = match fs::read_to_string(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        other => other?,
+    };
+    let next = patch_toml_key(&text, section, key, encoded);
+    if next != text {
+        fs::write(path, next)?;
+    }
+    Ok(true)
+}
+
+pub fn persist_bool(path: &Path, section: &str, key: &str, value: bool) -> io::Result<bool> {
+    persist_kv(path, section, key, if value { "true" } else { "false" })
+}
+
+pub fn persist_string(path: &Path, section: &str, key: &str, value: &str) -> io::Result<bool> {
+    persist_kv(path, section, key, &toml_quoted(value))
+}
+
+pub fn toml_quoted(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+pub fn patch_toml_key(text: &str, section: &str, key: &str, encoded: &str) -> String {
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split('\n')
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect()
+    };
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+
+    let header = format!("[{section}]");
+    let mut in_section = false;
+    let mut section_at: Option<usize> = None;
+    let mut key_at: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_section {
+                break;
+            }
+            if trimmed == header {
+                in_section = true;
+                section_at = Some(i);
+            }
+            continue;
+        }
+        if in_section && is_toml_key_line(line, key) {
+            key_at = Some(i);
+            break;
+        }
+    }
+
+    let replacement = format!("{key} = {encoded}");
+    if let Some(i) = key_at {
+        lines[i] = replacement;
+    } else if let Some(i) = section_at {
+        lines.insert(i + 1, replacement);
+    } else {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(header);
+        lines.push(replacement);
+    }
+
+    let mut out = lines.join(nl);
+    out.push_str(nl);
+    out
+}
+
+fn is_toml_key_line(line: &str, key: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    let Some(rest) = trimmed.strip_prefix(key) else {
+        return false;
+    };
+    rest.trim_start().starts_with('=')
+        && rest
+            .chars()
+            .next()
+            .is_some_and(|c| c == '=' || c.is_whitespace())
+}
+
 /// `{token}` names in appearance order. v1 only promises [`V1_TEMPLATE_TOKENS`].
 pub fn template_tokens(template: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -436,6 +540,68 @@ min_age_secs = 2
             parse(&fs::read_to_string(&path).unwrap()).unwrap(),
             Config::default()
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_toml_key_updates_existing_and_inserts_missing() {
+        let patched = patch_toml_key(DEFAULT_TOML, "general", "paused", "true");
+        let cfg = parse(&patched).unwrap();
+        assert!(cfg.general.paused);
+        assert!(cfg.general.start_with_windows);
+        assert_eq!(cfg.destination, Config::default().destination);
+
+        let patched = patch_toml_key(
+            DEFAULT_TOML,
+            "destination",
+            "root",
+            &toml_quoted(r"D:\Weekcase"),
+        );
+        let cfg = parse(&patched).unwrap();
+        assert_eq!(cfg.destination.root.as_deref(), Some(r"D:\Weekcase"));
+
+        let inserted = patch_toml_key(
+            "[general]\nstart_with_windows = true\n",
+            "general",
+            "paused",
+            "true",
+        );
+        assert!(inserted.contains("paused = true"));
+        let cfg = parse(&inserted).unwrap();
+        assert!(cfg.general.paused);
+
+        let appended = patch_toml_key("[watch]\nmax_pending = 8\n", "general", "paused", "true");
+        assert!(appended.contains("[general]"));
+        let cfg = parse(&appended).unwrap();
+        assert!(cfg.general.paused);
+        assert_eq!(cfg.watch.max_pending, 8);
+    }
+
+    #[test]
+    fn persist_kv_skips_missing_file() {
+        let path = PathBuf::from("/no/such/weekcase/missing-persist.toml");
+        assert!(!persist_bool(&path, "general", "paused", true).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn persist_kv_rewrites_existing() {
+        let dir = std::env::temp_dir().join(format!(
+            "weekcase-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("config.toml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, DEFAULT_TOML).unwrap();
+        assert!(persist_bool(&path, "general", "paused", true).unwrap());
+        assert!(persist_string(&path, "destination", "root", r"C:\Weekcase").unwrap());
+        let cfg = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(cfg.general.paused);
+        assert_eq!(cfg.destination.root.as_deref(), Some(r"C:\Weekcase"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

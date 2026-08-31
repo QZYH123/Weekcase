@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 
@@ -13,6 +13,7 @@ use weekcase::log_init;
 use weekcase::paths::Paths;
 use weekcase::stabilize;
 use weekcase::state::AppState;
+use weekcase::tray;
 use weekcase::undo;
 use weekcase::watch;
 
@@ -22,7 +23,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("weekcase: {err}");
+            tray::show_error(&err.to_string());
             ExitCode::from(1)
         }
     }
@@ -65,30 +66,45 @@ fn run() -> io::Result<ExitCode> {
     );
     let paused = Arc::new(AtomicBool::new(cfg.general.paused));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let cfg = Arc::new(cfg);
+    let archived_today = Arc::new(AtomicU32::new(0));
+    #[cfg(windows)]
+    if let Err(err) = tray::apply_autostart(cfg.general.start_with_windows) {
+        tracing::error!(%err, "autostart apply failed");
+    }
+    let cfg = Arc::new(Mutex::new(cfg));
     let state = Arc::new(Mutex::new(state));
     let candidates = Arc::new(Mutex::new(HashMap::new()));
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let watch = watch::start_watch(
-        Arc::clone(&cfg),
+        Arc::new(cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()),
         Arc::clone(&state),
         Arc::clone(&candidates),
         cmd_rx,
     );
-    let _stab = stabilize::start_stabilize(
+    let stab = stabilize::start_stabilize(
         Arc::clone(&cfg),
-        candidates,
-        paused,
+        Arc::clone(&candidates),
+        Arc::clone(&paused),
         Arc::clone(&shutdown),
-        folders,
+        folders.clone(),
         paths.undo_file(),
         paths.state_file(),
         Arc::clone(&state),
+        Arc::clone(&archived_today),
     );
-    let _cmd_tx = cmd_tx;
-    let _ = watch.join();
-    shutdown.store(true, Ordering::Relaxed);
-    Ok(ExitCode::SUCCESS)
+    tray::run(tray::App {
+        paths,
+        folders,
+        cfg,
+        state,
+        candidates,
+        paused,
+        shutdown,
+        archived_today,
+        watch: Some(watch),
+        watch_tx: cmd_tx,
+        stab,
+    })
 }
 
 struct SingleInstance {
