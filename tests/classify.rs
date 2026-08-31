@@ -42,8 +42,9 @@ fn snap(kind: SourceKind, path: &str, created: SystemTime) -> FileSnapshot {
     }
 }
 
-fn created_utc(secs: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(secs)
+fn created_utc(date_midnight: u64) -> SystemTime {
+    // Noon UTC keeps the civil date under Windows local time west of UTC.
+    UNIX_EPOCH + Duration::from_secs(date_midnight + 12 * 3600)
 }
 
 fn dest_str(path: &Path) -> String {
