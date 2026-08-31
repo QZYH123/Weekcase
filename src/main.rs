@@ -11,6 +11,7 @@ use weekcase::config;
 use weekcase::known_folders::KnownFolders;
 use weekcase::log_init;
 use weekcase::paths::Paths;
+use weekcase::settings;
 #[cfg(not(windows))]
 use weekcase::stabilize;
 use weekcase::state::AppState;
@@ -37,8 +38,21 @@ fn run() -> io::Result<ExitCode> {
         Some(held) => held,
         None => return Ok(ExitCode::SUCCESS),
     };
+    let cfg = if settings::needs_first_run(&paths.config_file()) {
+        let folders = KnownFolders::resolve();
+        match settings::prompt_first_run(&folders)? {
+            settings::FirstRun::Exit => return Ok(ExitCode::SUCCESS),
+            settings::FirstRun::Start { root } => settings::commit_first_run(
+                &paths,
+                root.as_deref(),
+                folders.default_root().as_deref(),
+                SystemTime::now(),
+            )?,
+        }
+    } else {
+        config::load_or_default(&paths.config_file())?
+    };
     log_init::init(&paths)?;
-    let cfg = config::load_or_default(&paths.config_file())?;
     let mut state = AppState::load(&paths.state_file())?;
     if state.first_run_at.is_none() {
         state.stamp_first_run(SystemTime::now());

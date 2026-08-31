@@ -172,6 +172,9 @@ fn folders_lock(folders: &Mutex<KnownFolders>) -> std::sync::MutexGuard<'_, Know
 pub use win::apply_autostart;
 
 #[cfg(windows)]
+pub use win::pick_directory as pick_archive_folder;
+
+#[cfg(windows)]
 mod win {
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -831,7 +834,7 @@ mod win {
         !confirm || rc == IDYES
     }
 
-    fn pick_directory(hwnd: HWND, start: Option<&Path>) -> io::Result<Option<PathBuf>> {
+    pub fn pick_directory(hwnd: HWND, start: Option<&Path>) -> io::Result<Option<PathBuf>> {
         let dlg: IFileDialog =
             unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
