@@ -15,7 +15,6 @@ pub struct Candidate {
     pub stable_since: Option<SystemTime>,
     pub attempts: u32,
     pub poisoned: bool,
-    pub ready_logged: bool,
     pub settle_secs: u64,
 }
 
@@ -108,7 +107,6 @@ mod tests {
             stable_since: ready.then_some(UNIX_EPOCH),
             attempts: 0,
             poisoned: false,
-            ready_logged: ready,
             settle_secs: 0,
         }
     }

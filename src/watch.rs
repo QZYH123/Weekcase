@@ -181,6 +181,31 @@ pub fn normalize_path(path: &Path) -> Option<PathBuf> {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn collect_admits(
+    dir: &Path,
+    source: &SourceConfig,
+    policy: &AdmitPolicy,
+    ignore: &IgnoreSet,
+    state: &AppState,
+    now: SystemTime,
+) -> io::Result<Vec<(PathBuf, Candidate)>> {
+    let mut out = Vec::new();
+    for ent in fs::read_dir(dir)? {
+        let Ok(ent) = ent else {
+            continue;
+        };
+        let name = ent.file_name();
+        let Some(path) = join_top_level(dir, &name.to_string_lossy()) else {
+            continue;
+        };
+        if let Some(cand) = consider_path(&path, source, policy, ignore, state, now) {
+            out.push((path, cand));
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn scan_dir(
     dir: &Path,
     source: &SourceConfig,
@@ -191,22 +216,14 @@ pub fn scan_dir(
     max_pending: usize,
     now: SystemTime,
 ) -> bool {
-    let entries = match fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return false,
+    let Ok(admits) = collect_admits(dir, source, policy, ignore, state, now) else {
+        return false;
     };
     let mut overflow = false;
-    for ent in entries.flatten() {
-        let name = ent.file_name();
-        let Some(path) = join_top_level(dir, &name.to_string_lossy()) else {
-            continue;
-        };
-        match consider_path(&path, source, policy, ignore, state, now) {
-            Some(cand) => match upsert(table, path, cand, max_pending, now) {
-                Upsert::Rejected | Upsert::ReplacedOldest => overflow = true,
-                _ => {}
-            },
-            None => continue,
+    for (path, cand) in admits {
+        match upsert(table, path, cand, max_pending, now) {
+            Upsert::Rejected | Upsert::ReplacedOldest => overflow = true,
+            _ => {}
         }
     }
     overflow
@@ -265,7 +282,6 @@ pub fn admit(
         stable_since: None,
         attempts: 0,
         poisoned: false,
-        ready_logged: false,
         settle_secs: source.settle_secs,
     })
 }
@@ -297,6 +313,8 @@ struct WatchRuntime {
     cmd: Receiver<WatchCmd>,
     #[cfg(windows)]
     iocp: Option<windows::Win32::Foundation::HANDLE>,
+    #[cfg(windows)]
+    shutting_down: bool,
 }
 
 struct SourceSlot {
@@ -312,6 +330,10 @@ struct SourceSlot {
     rdc: Option<RdcState>,
     #[cfg(windows)]
     rdc_fails: u32,
+    #[cfg(windows)]
+    rdc_closing: bool,
+    #[cfg(windows)]
+    reopen_after_close: bool,
 }
 
 #[cfg(windows)]
@@ -319,21 +341,33 @@ struct RdcState {
     handle: windows::Win32::Foundation::HANDLE,
     overlapped: Box<windows::Win32::System::IO::OVERLAPPED>,
     buffer: Vec<u8>,
+    pending: bool,
 }
 
 impl Drop for WatchRuntime {
     fn drop(&mut self) {
-        for i in 0..self.sources.len() {
-            self.close_source(i);
-        }
         #[cfg(windows)]
         {
+            self.shutting_down = true;
+            for i in 0..self.sources.len() {
+                self.begin_close(i, false);
+            }
+            self.drain_cancels();
+            for slot in &mut self.sources {
+                slot.rdc = None;
+            }
             if let Some(port) = self.iocp.take() {
                 if !port.is_invalid() {
                     unsafe {
                         let _ = windows::Win32::Foundation::CloseHandle(port);
                     }
                 }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            for slot in &mut self.sources {
+                slot.open = false;
             }
         }
     }
@@ -343,10 +377,17 @@ impl Drop for WatchRuntime {
 impl Drop for RdcState {
     fn drop(&mut self) {
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows::Win32::System::IO::CancelIo;
+        use windows::Win32::System::IO::OVERLAPPED;
+        if self.pending {
+            // A completion may still write these; leak rather than UAF.
+            let ov = std::mem::replace(&mut self.overlapped, Box::new(OVERLAPPED::default()));
+            let buf = std::mem::take(&mut self.buffer);
+            std::mem::forget(ov);
+            std::mem::forget(buf);
+            self.pending = false;
+        }
         if !self.handle.is_invalid() {
             unsafe {
-                let _ = CancelIo(self.handle);
                 let _ = CloseHandle(self.handle);
             }
             self.handle = HANDLE::default();
@@ -391,6 +432,8 @@ impl WatchRuntime {
             cmd,
             #[cfg(windows)]
             iocp: create_iocp(),
+            #[cfg(windows)]
+            shutting_down: false,
         }
     }
 
@@ -503,27 +546,30 @@ impl WatchRuntime {
     }
 
     fn scan_one(&mut self, i: usize, include_existing: bool, min_age_override: Option<Duration>) {
-        let interval = Duration::from_secs(self.sources[i].cfg.scan_interval_secs);
-        self.sources[i].next_scan = Instant::now() + interval;
         let Some(dir) = self.sources[i].watch_path.clone() else {
             return;
         };
         let policy = self.policy(i, include_existing, min_age_override);
         let snap = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let mut table = self.candidates.lock().unwrap_or_else(|e| e.into_inner());
-        let overflow = scan_dir(
-            &dir,
-            &self.sources[i].cfg,
-            &policy,
-            &self.ignore,
-            &snap,
-            &mut table,
-            self.max_pending,
-            SystemTime::now(),
-        );
-        drop(table);
-        if overflow {
-            self.note_overflow(&self.sources[i].cfg.id);
+        let src = self.sources[i].cfg.clone();
+        let now = SystemTime::now();
+        match collect_admits(&dir, &src, &policy, &self.ignore, &snap, now) {
+            Err(err) => {
+                tracing::error!(
+                    id = %src.id,
+                    path = %dir.display(),
+                    %err,
+                    "source directory lost"
+                );
+                self.source_lost(i);
+            }
+            Ok(admits) => {
+                self.sources[i].next_scan =
+                    Instant::now() + Duration::from_secs(src.scan_interval_secs);
+                for (path, cand) in admits {
+                    self.upsert_candidate(i, path, cand);
+                }
+            }
         }
     }
 
@@ -589,6 +635,10 @@ impl WatchRuntime {
         ) else {
             return;
         };
+        self.upsert_candidate(i, path, cand);
+    }
+
+    fn upsert_candidate(&mut self, i: usize, path: PathBuf, cand: Candidate) {
         let mut table = self.candidates.lock().unwrap_or_else(|e| e.into_inner());
         let result = upsert(&mut table, path, cand, self.max_pending, SystemTime::now());
         drop(table);
@@ -613,6 +663,11 @@ impl WatchRuntime {
         let Some(resolved) = self.sources[i].resolved.clone() else {
             return;
         };
+        #[cfg(windows)]
+        if self.sources[i].rdc.is_some() {
+            self.begin_close(i, true);
+            return;
+        }
         match prepare_source(&resolved, &self.folders) {
             Ok(watch_path) => {
                 #[cfg(windows)]
@@ -671,13 +726,9 @@ impl WatchRuntime {
     fn close_source(&mut self, i: usize) {
         self.sources[i].open = false;
         #[cfg(windows)]
-        {
-            self.sources[i].rdc = None;
-            self.sources[i].rdc_fails = 0;
-        }
+        self.begin_close(i, false);
     }
 
-    #[cfg(windows)]
     fn source_lost(&mut self, i: usize) {
         tracing::error!(
             id = %self.sources[i].cfg.id,
@@ -685,6 +736,7 @@ impl WatchRuntime {
             "source directory lost"
         );
         self.close_source(i);
+        self.sources[i].watch_path = None;
         self.sources[i].next_open = Instant::now() + MISSING_RETRY;
     }
 }
@@ -717,6 +769,10 @@ impl SourceSlot {
             rdc: None,
             #[cfg(windows)]
             rdc_fails: 0,
+            #[cfg(windows)]
+            rdc_closing: false,
+            #[cfg(windows)]
+            reopen_after_close: false,
         }
     }
 }
@@ -1028,12 +1084,34 @@ fn final_path_from_handle(
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy)]
+enum IocpKind {
+    Ok,
+    Overflow,
+    Failed,
+    Aborted,
+    Lost,
+}
+
+#[cfg(windows)]
+enum IocpEvent {
+    Idle,
+    Packet {
+        key: usize,
+        bytes: u32,
+        kind: IocpKind,
+    },
+}
+
+#[cfg(windows)]
 impl WatchRuntime {
     fn attach_rdc(&mut self, i: usize, watch_path: &Path) -> bool {
         use windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
         use windows::Win32::System::IO::CreateIoCompletionPort;
 
-        self.sources[i].rdc = None;
+        if self.sources[i].rdc.is_some() {
+            return false;
+        }
         let handle = match open_dir(watch_path, FILE_FLAG_BACKUP_SEMANTICS, true) {
             Ok(h) => h,
             Err(OpenError::Failed(err)) => {
@@ -1062,68 +1140,134 @@ impl WatchRuntime {
             handle,
             overlapped: Box::new(windows::Win32::System::IO::OVERLAPPED::default()),
             buffer: vec![0u8; self.buf_len],
+            pending: false,
         };
         if !issue_rdc(&mut rdc) {
             return false;
         }
         self.sources[i].rdc = Some(rdc);
         self.sources[i].rdc_fails = 0;
+        self.sources[i].rdc_closing = false;
         true
     }
 
-    fn wait_iocp(&mut self, timeout: Duration) -> bool {
-        use windows::core::HRESULT;
-        use windows::Win32::Foundation::{ERROR_NOTIFY_ENUM_DIR, WAIT_TIMEOUT};
-        use windows::Win32::System::IO::{GetQueuedCompletionStatus, OVERLAPPED};
+    fn begin_close(&mut self, i: usize, reopen: bool) {
+        use windows::Win32::System::IO::CancelIo;
 
+        self.sources[i].open = false;
+        if self.sources[i].rdc_closing {
+            self.sources[i].reopen_after_close |= reopen;
+            return;
+        }
+        self.sources[i].reopen_after_close = reopen;
+        let Some(rdc) = self.sources[i].rdc.as_mut() else {
+            if reopen && !self.shutting_down {
+                self.open_source(i);
+            }
+            return;
+        };
+        if rdc.pending {
+            unsafe {
+                let _ = CancelIo(rdc.handle);
+            }
+            self.sources[i].rdc_closing = true;
+            return;
+        }
+        self.sources[i].rdc = None;
+        self.sources[i].rdc_fails = 0;
+        if reopen && !self.shutting_down {
+            self.open_source(i);
+        }
+    }
+
+    fn finish_close(&mut self, i: usize) {
+        if let Some(rdc) = self.sources[i].rdc.as_mut() {
+            rdc.pending = false;
+        }
+        self.sources[i].rdc_closing = false;
+        self.sources[i].rdc_fails = 0;
+        self.sources[i].rdc = None;
+        let reopen = self.sources[i].reopen_after_close;
+        self.sources[i].reopen_after_close = false;
+        if reopen && !self.shutting_down {
+            self.open_source(i);
+        }
+    }
+
+    fn rebuild_watch(&mut self, i: usize) {
+        tracing::error!(id = %self.sources[i].cfg.id, "watch handle rebuild");
+        self.begin_close(i, true);
+    }
+
+    fn drain_cancels(&mut self) {
+        let Some(port) = self.iocp else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while self.sources.iter().any(|s| s.rdc_closing) && Instant::now() < deadline {
+            match poll_iocp(port, Duration::from_millis(50)) {
+                IocpEvent::Idle => {}
+                IocpEvent::Packet { key, bytes, kind } => {
+                    self.on_rdc_packet(key.wrapping_sub(1), bytes, kind);
+                }
+            }
+        }
+    }
+
+    fn wait_iocp(&mut self, timeout: Duration) -> bool {
         let Some(port) = self.iocp else {
             thread::sleep(timeout);
             return false;
         };
-        let mut bytes = 0u32;
-        let mut key = 0usize;
-        let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
-        let ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
-        // SAFETY: `port` is a live completion port; out-pointers are valid stack slots.
-        let result =
-            unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut overlapped, ms) };
-        match result {
-            Ok(()) => {
-                if key == 0 {
-                    return false;
-                }
-                self.on_rdc_complete(key - 1, bytes, true);
-                false
-            }
-            Err(e) => {
-                if e.code() == HRESULT::from_win32(WAIT_TIMEOUT.0) {
-                    return false;
-                }
-                if overlapped.is_null() || key == 0 {
-                    return false;
-                }
-                let overflow = e.code() == HRESULT::from_win32(ERROR_NOTIFY_ENUM_DIR.0);
-                self.on_rdc_complete(key - 1, bytes, !overflow);
+        match poll_iocp(port, timeout) {
+            IocpEvent::Idle => false,
+            IocpEvent::Packet { key, bytes, kind } => {
+                self.on_rdc_packet(key.wrapping_sub(1), bytes, kind);
                 false
             }
         }
     }
 
-    fn on_rdc_complete(&mut self, i: usize, bytes: u32, parse: bool) {
-        if i >= self.sources.len() || self.sources[i].rdc.is_none() {
+    fn on_rdc_packet(&mut self, i: usize, bytes: u32, kind: IocpKind) {
+        if i >= self.sources.len() {
             return;
         }
-        if !parse || bytes == 0 {
-            tracing::warn!(id = %self.sources[i].cfg.id, "watch_overflow");
-            self.scan_one(i, false, None);
-        } else {
-            let events = {
-                let rdc = self.sources[i].rdc.as_ref().unwrap();
-                parse_notify_buffer(&rdc.buffer, bytes as usize)
-            };
-            self.apply_notify(i, events);
+        if self.sources[i].rdc_closing {
+            self.finish_close(i);
+            return;
         }
-        self.reissue_or_rebuild(i);
+        if self.sources[i].rdc.is_none() {
+            return;
+        }
+        if let Some(rdc) = self.sources[i].rdc.as_mut() {
+            rdc.pending = false;
+        }
+        match kind {
+            IocpKind::Aborted | IocpKind::Lost => self.source_lost(i),
+            IocpKind::Overflow => {
+                self.sources[i].rdc_fails = 0;
+                tracing::warn!(id = %self.sources[i].cfg.id, "watch_overflow");
+                self.scan_one(i, false, None);
+                self.reissue_or_rebuild(i);
+            }
+            IocpKind::Ok => {
+                self.sources[i].rdc_fails = 0;
+                let events = {
+                    let rdc = self.sources[i].rdc.as_ref().unwrap();
+                    parse_notify_buffer(&rdc.buffer, bytes as usize)
+                };
+                self.apply_notify(i, events);
+                self.reissue_or_rebuild(i);
+            }
+            IocpKind::Failed => {
+                self.sources[i].rdc_fails = self.sources[i].rdc_fails.saturating_add(1);
+                if self.sources[i].rdc_fails >= 5 {
+                    self.rebuild_watch(i);
+                } else {
+                    self.reissue_or_rebuild(i);
+                }
+            }
+        }
     }
 
     fn apply_notify(&mut self, i: usize, events: Vec<(u32, String)>) {
@@ -1158,15 +1302,76 @@ impl WatchRuntime {
     }
 
     fn reissue_or_rebuild(&mut self, i: usize) {
-        let ok = self.sources[i].rdc.as_mut().is_some_and(issue_rdc);
-        if ok {
-            self.sources[i].rdc_fails = 0;
+        if self.sources[i].rdc_closing || self.sources[i].rdc.is_none() {
             return;
         }
-        self.sources[i].rdc_fails = self.sources[i].rdc_fails.saturating_add(1);
-        if self.sources[i].rdc_fails >= 5 {
-            self.source_lost(i);
-            self.sources[i].next_open = Instant::now();
+        if self.sources[i].rdc.as_mut().is_some_and(issue_rdc) {
+            return;
+        }
+        self.rebuild_watch(i);
+    }
+}
+
+#[cfg(windows)]
+fn poll_iocp(port: windows::Win32::Foundation::HANDLE, timeout: Duration) -> IocpEvent {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_NETNAME_DELETED,
+        ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED, ERROR_PATH_NOT_FOUND, WAIT_TIMEOUT,
+    };
+    use windows::Win32::System::IO::{GetQueuedCompletionStatus, OVERLAPPED};
+
+    let mut bytes = 0u32;
+    let mut key = 0usize;
+    let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
+    let ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+    // SAFETY: `port` is a live completion port; out-pointers are valid stack slots.
+    let result =
+        unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut overlapped, ms) };
+    match result {
+        Ok(()) => {
+            if key == 0 {
+                IocpEvent::Idle
+            } else if bytes == 0 {
+                IocpEvent::Packet {
+                    key,
+                    bytes,
+                    kind: IocpKind::Overflow,
+                }
+            } else {
+                IocpEvent::Packet {
+                    key,
+                    bytes,
+                    kind: IocpKind::Ok,
+                }
+            }
+        }
+        Err(e) => {
+            if e.code() == HRESULT::from_win32(WAIT_TIMEOUT.0) {
+                return IocpEvent::Idle;
+            }
+            if overlapped.is_null() || key == 0 {
+                return IocpEvent::Idle;
+            }
+            let kind = if e.code() == HRESULT::from_win32(ERROR_OPERATION_ABORTED.0) {
+                IocpKind::Aborted
+            } else if e.code() == HRESULT::from_win32(ERROR_NOTIFY_ENUM_DIR.0) {
+                IocpKind::Overflow
+            } else if [
+                ERROR_ACCESS_DENIED.0,
+                ERROR_INVALID_HANDLE.0,
+                ERROR_FILE_NOT_FOUND.0,
+                ERROR_PATH_NOT_FOUND.0,
+                ERROR_NETNAME_DELETED.0,
+            ]
+            .into_iter()
+            .any(|c| e.code() == HRESULT::from_win32(c))
+            {
+                IocpKind::Lost
+            } else {
+                IocpKind::Failed
+            };
+            IocpEvent::Packet { key, bytes, kind }
         }
     }
 }
@@ -1182,7 +1387,8 @@ fn issue_rdc(rdc: &mut RdcState) -> bool {
 
     let filter =
         FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
-    // SAFETY: `rdc.buffer` and `rdc.overlapped` stay pinned in RdcState until completion or CancelIo.
+    // SAFETY: `rdc.buffer` and `rdc.overlapped` stay pinned in RdcState until the matching
+    // completion packet is dequeued.
     let result = unsafe {
         ReadDirectoryChangesW(
             rdc.handle,
@@ -1196,9 +1402,16 @@ fn issue_rdc(rdc: &mut RdcState) -> bool {
         )
     };
     match result {
-        Ok(()) => true,
-        Err(e) if e.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => true,
+        Ok(()) => {
+            rdc.pending = true;
+            true
+        }
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => {
+            rdc.pending = true;
+            true
+        }
         Err(e) => {
+            rdc.pending = false;
             tracing::error!(%e, "ReadDirectoryChangesW failed");
             false
         }
@@ -1297,6 +1510,20 @@ mod tests {
             now
         )
         .is_some());
+    }
+
+    #[test]
+    fn collect_admits_errors_when_dir_missing() {
+        let src = downloads(0);
+        let err = collect_admits(
+            Path::new("/no/such/weekcase-watch-src"),
+            &src,
+            &policy(0, UNIX_EPOCH),
+            &IgnoreSet::empty(),
+            &AppState::default(),
+            SystemTime::now(),
+        );
+        assert!(err.is_err());
     }
 
     #[test]

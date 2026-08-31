@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,10 +22,11 @@ pub fn start_stabilize(
         .name("weekcase-stab".into())
         .spawn(move || {
             let tick = Duration::from_millis(cfg.watch.tick_ms.max(1));
+            let mut logged = HashSet::new();
             while !shutdown.load(Ordering::Relaxed) {
                 let paused = paused.load(Ordering::Relaxed);
                 let ready = tick_once(&candidates, &ignore, SystemTime::now(), paused);
-                for snap in ready {
+                for snap in take_new_ready(&ready, &mut logged) {
                     tracing::info!(
                         path = %snap.path.display(),
                         source = %snap.source_id,
@@ -91,7 +92,6 @@ fn sample(
         cand.last_mtime = info.mtime;
         cand.created = info.created;
         cand.stable_since = None;
-        cand.ready_logged = false;
         return;
     }
     if info.size == 0
@@ -109,11 +109,22 @@ fn sample(
     if cand.stable_since.is_none() {
         cand.stable_since = Some(now);
     }
-    if paused || cand.ready_logged || !cand.is_ready(now) {
+    if paused || !cand.is_ready(now) {
         return;
     }
-    cand.ready_logged = true;
     ready.push(cand.snapshot(path.to_path_buf()));
+}
+
+fn take_new_ready<'a>(
+    ready: &'a [FileSnapshot],
+    logged: &mut HashSet<PathBuf>,
+) -> Vec<&'a FileSnapshot> {
+    let live: HashSet<&Path> = ready.iter().map(|s| s.path.as_path()).collect();
+    logged.retain(|p| live.contains(p.as_path()));
+    ready
+        .iter()
+        .filter(|snap| logged.insert(snap.path.clone()))
+        .collect()
 }
 
 fn lock_probe_ok(path: &Path) -> bool {
@@ -207,7 +218,6 @@ mod tests {
             stable_since: None,
             attempts: 0,
             poisoned: false,
-            ready_logged: false,
             settle_secs,
         }
     }
@@ -255,8 +265,26 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].path, path);
         let ready = tick_once(&table, &ignore(), now, false);
-        assert!(ready.is_empty());
+        assert_eq!(ready.len(), 1, "settled files stay in ready every tick");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ready_for_execute_logs_once_per_stable_period() {
+        let snap = FileSnapshot {
+            path: PathBuf::from("/a.pdf"),
+            source_id: "downloads".into(),
+            source_kind: SourceKind::Downloads,
+            size: 1,
+            mtime: UNIX_EPOCH,
+            created: UNIX_EPOCH,
+        };
+        let ready = [snap.clone()];
+        let mut logged = HashSet::new();
+        assert_eq!(take_new_ready(&ready, &mut logged).len(), 1);
+        assert_eq!(take_new_ready(&ready, &mut logged).len(), 0);
+        assert!(take_new_ready(&[], &mut logged).is_empty());
+        assert_eq!(take_new_ready(&ready, &mut logged).len(), 1);
     }
 
     #[test]
