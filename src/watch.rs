@@ -1112,6 +1112,10 @@ impl WatchRuntime {
         if self.sources[i].rdc.is_some() {
             return false;
         }
+        // Overlapped RDC with no port can never dequeue cancel packets; listing-only.
+        let Some(port) = self.iocp else {
+            return true;
+        };
         let handle = match open_dir(watch_path, FILE_FLAG_BACKUP_SEMANTICS, true) {
             Ok(h) => h,
             Err(OpenError::Failed(err)) => {
@@ -1125,16 +1129,14 @@ impl WatchRuntime {
             }
             Err(_) => return false,
         };
-        if let Some(port) = self.iocp {
-            // SAFETY: `handle` is a newly opened directory; `port` is the T1 completion port.
-            // The returned handle aliases `port` and must not be closed.
-            if unsafe { CreateIoCompletionPort(handle, Some(port), i + 1, 0) }.is_err() {
-                tracing::error!(id = %self.sources[i].cfg.id, "associate IOCP failed");
-                unsafe {
-                    let _ = windows::Win32::Foundation::CloseHandle(handle);
-                }
-                return false;
+        // SAFETY: `handle` is a newly opened directory; `port` is the T1 completion port.
+        // The returned handle aliases `port` and must not be closed.
+        if unsafe { CreateIoCompletionPort(handle, Some(port), i + 1, 0) }.is_err() {
+            tracing::error!(id = %self.sources[i].cfg.id, "associate IOCP failed");
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
             }
+            return false;
         }
         let mut rdc = RdcState {
             handle,
@@ -1166,13 +1168,14 @@ impl WatchRuntime {
             }
             return;
         };
-        if rdc.pending {
+        if rdc.pending && self.iocp.is_some() {
             unsafe {
                 let _ = CancelIo(rdc.handle);
             }
             self.sources[i].rdc_closing = true;
             return;
         }
+        rdc.pending = false;
         self.sources[i].rdc = None;
         self.sources[i].rdc_fails = 0;
         if reopen && !self.shutting_down {
