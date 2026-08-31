@@ -127,13 +127,13 @@ mod win {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetMessageW, GetWindowLongPtrW, IsDialogMessageW, MessageBoxW, PostQuitMessage,
-        RegisterClassExW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW,
-        ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_READONLY,
-        GWLP_USERDATA, HMENU, MB_ICONERROR, MB_OK, MSG, SW_HIDE, SW_SHOWNORMAL, WINDOW_EX_STYLE,
-        WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT, WNDCLASSEXW, WNDPROC,
-        WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_OVERLAPPED, WS_SYSMENU,
-        WS_TABSTOP, WS_VISIBLE,
+        GetMessageW, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW, MessageBoxW,
+        PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+        SetWindowTextW, ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON, CW_USEDEFAULT,
+        ES_AUTOHSCROLL, ES_READONLY, GWLP_USERDATA, HMENU, IDC_ARROW, MB_ICONERROR, MB_OK, MSG,
+        SW_HIDE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+        WM_SETFONT, WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
+        WS_EX_CONTROLPARENT, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
     };
 
     use super::{
@@ -189,6 +189,7 @@ mod win {
             cbSize: core::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: WNDPROC::Some(wndproc),
             hInstance: hinstance,
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
             hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },
             lpszClassName: w!("WeekcaseFirstRun"),
             ..Default::default()
