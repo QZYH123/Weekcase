@@ -1,4 +1,5 @@
 pub mod candidate;
+pub mod classify;
 pub mod config;
 pub mod known_folders;
 pub mod log_init;
