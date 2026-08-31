@@ -665,7 +665,9 @@ impl WatchRuntime {
         if self.sources[i].dead {
             return;
         }
+        self.refresh_unresolved(i);
         let Some(resolved) = self.sources[i].resolved.clone() else {
+            self.schedule_retry(i, true);
             return;
         };
         #[cfg(windows)]
@@ -715,6 +717,14 @@ impl WatchRuntime {
         }
     }
 
+    fn refresh_unresolved(&mut self, i: usize) {
+        if self.sources[i].resolved.is_some() {
+            return;
+        }
+        self.folders = KnownFolders::resolve();
+        self.sources[i].resolved = self.sources[i].cfg.resolved_path(&self.folders);
+    }
+
     fn schedule_retry(&mut self, i: usize, missing: bool) {
         self.sources[i].open = false;
         self.sources[i].watch_path = None;
@@ -750,17 +760,13 @@ impl SourceSlot {
     fn from_config(src: &SourceConfig, folders: &KnownFolders) -> Self {
         let now = Instant::now();
         let resolved = src.resolved_path(folders);
-        let (dead, resolved) = match resolved {
-            None => {
-                tracing::error!(
-                    id = %src.id,
-                    kind = ?src.kind,
-                    "known folder unresolved; source disabled"
-                );
-                (true, None)
-            }
-            Some(p) => (false, Some(p)),
-        };
+        if resolved.is_none() {
+            tracing::error!(
+                id = %src.id,
+                kind = ?src.kind,
+                "known folder unresolved; will retry"
+            );
+        }
         Self {
             cfg: src.clone(),
             resolved,
@@ -769,7 +775,7 @@ impl SourceSlot {
             next_open: now,
             backoff_i: 0,
             open: false,
-            dead,
+            dead: false,
             #[cfg(windows)]
             rdc: None,
             #[cfg(windows)]
@@ -1711,5 +1717,12 @@ mod tests {
             first_run_from(&state),
             Some(UNIX_EPOCH + Duration::from_secs(42))
         );
+    }
+
+    #[test]
+    fn unresolved_known_folder_is_not_dead() {
+        let slot = SourceSlot::from_config(&SourceConfig::downloads(), &KnownFolders::default());
+        assert!(!slot.dead);
+        assert!(slot.resolved.is_none());
     }
 }

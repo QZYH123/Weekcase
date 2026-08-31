@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::candidate::{Candidate, FileSnapshot};
 use crate::classify::{classify, ClassifyError};
 use crate::config::Config;
-use crate::execute::{execute_move, ExecError};
+use crate::execute::{execute_move, undo_last, ExecCmd, ExecError};
 use crate::known_folders::KnownFolders;
 use crate::state::AppState;
 use crate::watch::{inspect_file, is_ignored, FileInfo, IgnoreSet};
@@ -24,11 +25,12 @@ pub fn start_stabilize(
     candidates: Arc<Mutex<HashMap<PathBuf, Candidate>>>,
     paused: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    folders: KnownFolders,
+    folders: Arc<Mutex<KnownFolders>>,
     undo_path: PathBuf,
     state_path: PathBuf,
     state: Arc<Mutex<AppState>>,
     archived_today: Arc<AtomicU32>,
+    exec: Receiver<ExecCmd>,
 ) -> JoinHandle<()> {
     let ignore = IgnoreSet::from_process();
     thread::Builder::new()
@@ -40,6 +42,7 @@ pub fn start_stabilize(
             let mut illegal_warned = HashSet::new();
             let mut persist_retry = false;
             while !shutdown.load(Ordering::Relaxed) {
+                drain_exec(&exec, &undo_path);
                 flush_persist(&state, &state_path, &mut persist_retry);
                 let paused_now = paused.load(Ordering::Relaxed);
                 let ready = tick_once_with(
@@ -59,11 +62,13 @@ pub fn start_stabilize(
                         "ready_for_execute"
                     );
                 }
+                drain_exec(&exec, &undo_path);
                 if !ready.is_empty() && !paused.load(Ordering::Relaxed) {
                     let cfg_now = cfg_snapshot(&cfg);
+                    let folders_now = folders_snapshot(&folders);
                     let ctx = ReadyCtx {
                         cfg: &cfg_now,
-                        folders: &folders,
+                        folders: &folders_now,
                         candidates: &candidates,
                         live: &state,
                         undo_path: &undo_path,
@@ -86,6 +91,21 @@ pub fn start_stabilize(
 
 fn cfg_snapshot(cfg: &Mutex<Config>) -> Config {
     cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn folders_snapshot(folders: &Mutex<KnownFolders>) -> KnownFolders {
+    folders.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn drain_exec(exec: &Receiver<ExecCmd>, undo_path: &Path) {
+    loop {
+        match exec.try_recv() {
+            Ok(ExecCmd::UndoLast { reply }) => {
+                let _ = reply.send(undo_last(undo_path));
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return,
+        }
+    }
 }
 
 pub fn tick_once(

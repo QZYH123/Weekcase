@@ -11,10 +11,12 @@ use weekcase::config;
 use weekcase::known_folders::KnownFolders;
 use weekcase::log_init;
 use weekcase::paths::Paths;
+#[cfg(not(windows))]
 use weekcase::stabilize;
 use weekcase::state::AppState;
 use weekcase::tray;
 use weekcase::undo;
+#[cfg(not(windows))]
 use weekcase::watch;
 
 const SINGLE_INSTANCE_MUTEX: &str = r"Local\Weekcase.SingleInstance";
@@ -51,19 +53,6 @@ fn run() -> io::Result<ExitCode> {
     ) {
         tracing::error!(%err, "undo compact failed");
     }
-    let folders = KnownFolders::resolve();
-    tracing::info!(
-        config = %paths.config_file().display(),
-        state = %paths.state_file().display(),
-        undo = %paths.undo_file().display(),
-        log = %paths.log_file().display(),
-        portable = paths.portable,
-        sources = cfg.sources.len(),
-        first_run_at = ?state.first_run_at,
-        downloads = ?folders.downloads,
-        screenshots = ?folders.screenshots,
-        "weekcase started"
-    );
     let paused = Arc::new(AtomicBool::new(cfg.general.paused));
     let shutdown = Arc::new(AtomicBool::new(false));
     let archived_today = Arc::new(AtomicU32::new(0));
@@ -75,23 +64,62 @@ fn run() -> io::Result<ExitCode> {
     let state = Arc::new(Mutex::new(state));
     let candidates = Arc::new(Mutex::new(HashMap::new()));
     let (cmd_tx, cmd_rx) = mpsc::channel();
-    let watch = watch::start_watch(
-        Arc::new(cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()),
-        Arc::clone(&state),
-        Arc::clone(&candidates),
-        cmd_rx,
-    );
-    let stab = stabilize::start_stabilize(
-        Arc::clone(&cfg),
-        Arc::clone(&candidates),
-        Arc::clone(&paused),
-        Arc::clone(&shutdown),
-        folders.clone(),
-        paths.undo_file(),
-        paths.state_file(),
-        Arc::clone(&state),
-        Arc::clone(&archived_today),
-    );
+    let (exec_tx, exec_rx) = mpsc::channel();
+    let folders = Arc::new(Mutex::new(KnownFolders::default()));
+
+    #[cfg(not(windows))]
+    let (watch, stab, pending_watch_rx, pending_exec_rx) = {
+        let resolved = KnownFolders::resolve();
+        tracing::info!(
+            config = %paths.config_file().display(),
+            state = %paths.state_file().display(),
+            undo = %paths.undo_file().display(),
+            log = %paths.log_file().display(),
+            portable = paths.portable,
+            sources = cfg.lock().unwrap_or_else(|e| e.into_inner()).sources.len(),
+            first_run_at = ?state.lock().unwrap_or_else(|e| e.into_inner()).first_run_at,
+            downloads = ?resolved.downloads,
+            screenshots = ?resolved.screenshots,
+            "weekcase started"
+        );
+        *folders.lock().unwrap_or_else(|e| e.into_inner()) = resolved;
+        let watch = watch::start_watch(
+            Arc::new(cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            Arc::clone(&state),
+            Arc::clone(&candidates),
+            cmd_rx,
+        );
+        let stab = stabilize::start_stabilize(
+            Arc::clone(&cfg),
+            Arc::clone(&candidates),
+            Arc::clone(&paused),
+            Arc::clone(&shutdown),
+            Arc::clone(&folders),
+            paths.undo_file(),
+            paths.state_file(),
+            Arc::clone(&state),
+            Arc::clone(&archived_today),
+            exec_rx,
+        );
+        (Some(watch), Some(stab), None, None)
+    };
+
+    #[cfg(windows)]
+    let (watch, stab, pending_watch_rx, pending_exec_rx) = {
+        tracing::info!(
+            config = %paths.config_file().display(),
+            state = %paths.state_file().display(),
+            undo = %paths.undo_file().display(),
+            log = %paths.log_file().display(),
+            portable = paths.portable,
+            sources = cfg.lock().unwrap_or_else(|e| e.into_inner()).sources.len(),
+            first_run_at = ?state.lock().unwrap_or_else(|e| e.into_inner()).first_run_at,
+            kf_delay_ms = tray::KF_DELAY_MS,
+            "weekcase started"
+        );
+        (None, None, Some(cmd_rx), Some(exec_rx))
+    };
+
     tray::run(tray::App {
         paths,
         folders,
@@ -101,9 +129,12 @@ fn run() -> io::Result<ExitCode> {
         paused,
         shutdown,
         archived_today,
-        watch: Some(watch),
+        watch,
         watch_tx: cmd_tx,
+        pending_watch_rx,
         stab,
+        exec_tx,
+        pending_exec_rx,
     })
 }
 

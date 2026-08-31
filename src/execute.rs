@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
 use crate::classify::{FileSnapshot, Placement};
@@ -13,6 +14,12 @@ use crate::undo::{
 };
 
 pub const MAX_COLLISION_SUFFIX: u32 = 99;
+
+pub enum ExecCmd {
+    UndoLast {
+        reply: Sender<Result<JournalRecord, UndoError>>,
+    },
+}
 
 #[derive(Debug)]
 pub enum ExecError {

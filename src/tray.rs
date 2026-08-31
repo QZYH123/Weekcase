@@ -5,21 +5,24 @@ use std::process::ExitCode;
 #[cfg(not(windows))]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::candidate::Candidate;
 use crate::config::Config;
+use crate::execute::ExecCmd;
 use crate::known_folders::{deny_destination, DenyReason, KnownFolders};
 use crate::paths::Paths;
 use crate::state::AppState;
 use crate::undo::UndoError;
 use crate::watch::WatchCmd;
 
+pub const KF_DELAY_MS: u32 = 15_000;
+
 pub struct App {
     pub paths: Paths,
-    pub folders: KnownFolders,
+    pub folders: Arc<Mutex<KnownFolders>>,
     pub cfg: Arc<Mutex<Config>>,
     pub state: Arc<Mutex<AppState>>,
     pub candidates: Arc<Mutex<HashMap<PathBuf, Candidate>>>,
@@ -28,7 +31,10 @@ pub struct App {
     pub archived_today: Arc<AtomicU32>,
     pub watch: Option<JoinHandle<()>>,
     pub watch_tx: Sender<WatchCmd>,
-    pub stab: JoinHandle<()>,
+    pub pending_watch_rx: Option<Receiver<WatchCmd>>,
+    pub stab: Option<JoinHandle<()>>,
+    pub exec_tx: Sender<ExecCmd>,
+    pub pending_exec_rx: Option<Receiver<ExecCmd>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,7 +147,9 @@ fn run_stub(app: App) -> io::Result<ExitCode> {
         let _ = watch.join();
     }
     shutdown.store(true, Ordering::Relaxed);
-    let _ = stab.join();
+    if let Some(stab) = stab {
+        let _ = stab.join();
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -153,6 +161,11 @@ fn cfg_lock(cfg: &Mutex<Config>) -> std::sync::MutexGuard<'_, Config> {
 #[cfg(windows)]
 fn state_lock(state: &Mutex<AppState>) -> std::sync::MutexGuard<'_, AppState> {
     state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(windows)]
+fn folders_lock(folders: &Mutex<KnownFolders>) -> std::sync::MutexGuard<'_, KnownFolders> {
+    folders.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(windows)]
@@ -187,17 +200,17 @@ mod win {
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
         DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer, LoadIconW,
-        MessageBoxW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+        MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
         SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage,
         CW_USEDEFAULT, GWLP_USERDATA, HICON, IDI_APPLICATION, IDYES, MB_ICONERROR, MB_ICONWARNING,
         MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNORMAL,
-        TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP,
+        TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
         WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WNDPROC, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     use super::{
-        cfg_lock, check_archive_root, deny_text, enabled_source_paths, state_lock, tooltip_text,
-        undo_error_text, App, ArchiveRoot,
+        cfg_lock, check_archive_root, deny_text, enabled_source_paths, folders_lock, state_lock,
+        tooltip_text, undo_error_text, App, ArchiveRoot, KF_DELAY_MS,
     };
     use crate::candidate::Candidate;
     use crate::config::Config;
@@ -208,7 +221,8 @@ mod win {
 
     const WM_TRAY: u32 = WM_APP + 1;
     const TRAY_ID: u32 = 1;
-    const TIMER_ID: usize = 1;
+    const TIMER_TIP: usize = 1;
+    const TIMER_BOOT: usize = 2;
     const ID_PAUSE: usize = 1001;
     const ID_UNDO: usize = 1002;
     const ID_SWEEP: usize = 1003;
@@ -225,7 +239,7 @@ mod win {
 
     struct Inner {
         paths: Paths,
-        folders: KnownFolders,
+        folders: Arc<Mutex<KnownFolders>>,
         cfg: Arc<Mutex<Config>>,
         state: Arc<Mutex<AppState>>,
         candidates: Arc<Mutex<HashMap<PathBuf, Candidate>>>,
@@ -234,10 +248,14 @@ mod win {
         archived_today: Arc<AtomicU32>,
         watch: Option<JoinHandle<()>>,
         watch_tx: Sender<WatchCmd>,
-        stab: JoinHandle<()>,
+        pending_watch_rx: Option<std::sync::mpsc::Receiver<WatchCmd>>,
+        stab: Option<JoinHandle<()>>,
+        exec_tx: Sender<crate::execute::ExecCmd>,
+        pending_exec_rx: Option<std::sync::mpsc::Receiver<crate::execute::ExecCmd>>,
         hwnd: HWND,
         icon: HICON,
         icon_added: bool,
+        quitting: bool,
         taskbar_created: u32,
     }
 
@@ -279,10 +297,14 @@ mod win {
                 archived_today: app.archived_today,
                 watch: app.watch,
                 watch_tx: app.watch_tx,
+                pending_watch_rx: app.pending_watch_rx,
                 stab: app.stab,
+                exec_tx: app.exec_tx,
+                pending_exec_rx: app.pending_exec_rx,
                 hwnd: HWND::default(),
                 icon,
                 icon_added: false,
+                quitting: false,
                 taskbar_created,
             }),
         });
@@ -313,7 +335,8 @@ mod win {
         host.inner.borrow_mut().hwnd = hwnd;
         host.inner.borrow_mut().sync_icon();
         unsafe {
-            SetTimer(Some(hwnd), TIMER_ID, 2000, None);
+            SetTimer(Some(hwnd), TIMER_TIP, 2000, None);
+            SetTimer(Some(hwnd), TIMER_BOOT, KF_DELAY_MS, None);
         }
 
         let mut msg = MSG::default();
@@ -324,21 +347,28 @@ mod win {
             }
         }
 
+        {
+            let mut inner = host.inner.borrow_mut();
+            inner.quitting = true;
+            inner.remove_icon();
+        }
         unsafe {
-            let _ = KillTimer(Some(hwnd), TIMER_ID);
+            let _ = KillTimer(Some(hwnd), TIMER_TIP);
+            let _ = KillTimer(Some(hwnd), TIMER_BOOT);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             let _ = DestroyWindow(hwnd);
         }
 
         let Host { inner } = *host;
         let mut inner = inner.into_inner();
-        inner.remove_icon();
         let _ = inner.watch_tx.send(WatchCmd::Shutdown);
         inner.shutdown.store(true, Ordering::Relaxed);
         if let Some(watch) = inner.watch.take() {
             let _ = watch.join();
         }
-        let _ = inner.stab.join();
+        if let Some(stab) = inner.stab.take() {
+            let _ = stab.join();
+        }
         if com_owned {
             unsafe {
                 CoUninitialize();
@@ -379,7 +409,12 @@ mod win {
             }
             match msg {
                 WM_TIMER => {
-                    self.sync_icon();
+                    if wparam.0 == TIMER_BOOT {
+                        let _ = unsafe { KillTimer(Some(hwnd), TIMER_BOOT) };
+                        self.boot_pipeline();
+                    } else {
+                        self.sync_icon();
+                    }
                     LRESULT(0)
                 }
                 m if m == WM_TRAY => {
@@ -451,7 +486,10 @@ mod win {
                     None,
                 )
             };
-            let _ = unsafe { DestroyMenu(menu) };
+            unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+                let _ = DestroyMenu(menu);
+            }
 
             match cmd.0 as usize {
                 ID_PAUSE => self.toggle_pause(),
@@ -462,7 +500,10 @@ mod win {
                 ID_OPEN_LOG => self.open_path(&self.paths.log_file()),
                 ID_RELOAD => self.reload_config(),
                 ID_AUTOSTART => self.toggle_autostart(),
-                ID_EXIT => self.request_quit(),
+                ID_EXIT => {
+                    self.request_quit();
+                    return;
+                }
                 _ => {}
             }
             self.sync_icon();
@@ -480,8 +521,26 @@ mod win {
         }
 
         fn undo_last(&mut self) {
-            if let Err(err) = crate::execute::undo_last(&self.paths.undo_file()) {
-                self.error(&undo_error_text(&err));
+            if self.pending_exec_rx.is_some() {
+                match crate::execute::undo_last(&self.paths.undo_file()) {
+                    Ok(_) => {}
+                    Err(err) => self.error(&undo_error_text(&err)),
+                }
+                return;
+            }
+            let (reply, rx) = std::sync::mpsc::channel();
+            if self
+                .exec_tx
+                .send(crate::execute::ExecCmd::UndoLast { reply })
+                .is_err()
+            {
+                self.error("归档线程已停止");
+                return;
+            }
+            match rx.recv() {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => self.error(&undo_error_text(&err)),
+                Err(_) => self.error("撤销未完成"),
             }
         }
 
@@ -508,7 +567,9 @@ mod win {
         }
 
         fn pick_root(&mut self) {
-            let current = cfg_lock(&self.cfg).resolved_root(&self.folders);
+            let folders = KnownFolders::resolve();
+            *folders_lock(&self.folders) = folders.clone();
+            let current = cfg_lock(&self.cfg).resolved_root(&folders);
             let picked = match pick_directory(self.hwnd, current.as_deref()) {
                 Ok(Some(path)) => path,
                 Ok(None) => return,
@@ -517,8 +578,8 @@ mod win {
                     return;
                 }
             };
-            let sources = enabled_source_paths(&cfg_lock(&self.cfg), &self.folders);
-            match check_archive_root(&picked, &sources, &self.folders) {
+            let sources = enabled_source_paths(&cfg_lock(&self.cfg), &folders);
+            match check_archive_root(&picked, &sources, &folders) {
                 Err(reason) => {
                     self.error(deny_text(reason));
                     return;
@@ -546,10 +607,12 @@ mod win {
             ) {
                 tracing::error!(%err, "persist destination.root failed");
             }
+            self.unpoison_and_rescan();
         }
 
         fn open_root(&mut self) {
-            let Some(root) = cfg_lock(&self.cfg).resolved_root(&self.folders) else {
+            let folders = folders_lock(&self.folders).clone();
+            let Some(root) = cfg_lock(&self.cfg).resolved_root(&folders) else {
                 self.error("无法解析归档目录");
                 return;
             };
@@ -590,6 +653,7 @@ mod win {
                     }
                     *cfg_lock(&self.cfg) = new;
                     self.rebuild_watch();
+                    self.unpoison_and_rescan();
                 }
                 Err(err) => self.error(&format!("无法加载配置：{err}")),
             }
@@ -613,6 +677,10 @@ mod win {
         }
 
         fn rebuild_watch(&mut self) {
+            *folders_lock(&self.folders) = KnownFolders::resolve();
+            if self.watch.is_none() {
+                return;
+            }
             let _ = self.watch_tx.send(WatchCmd::Shutdown);
             if let Some(watch) = self.watch.take() {
                 let _ = watch.join();
@@ -628,7 +696,52 @@ mod win {
             ));
         }
 
+        fn unpoison_and_rescan(&mut self) {
+            {
+                let mut table = self.candidates.lock().unwrap_or_else(|e| e.into_inner());
+                crate::candidate::clear_poisoned(&mut table, None);
+            }
+            let _ = self.watch_tx.send(WatchCmd::Rescan {
+                source: None,
+                include_existing: false,
+                min_age_override: None,
+            });
+        }
+
+        fn boot_pipeline(&mut self) {
+            if self.watch.is_some() || self.quitting {
+                return;
+            }
+            let Some(cmd_rx) = self.pending_watch_rx.take() else {
+                return;
+            };
+            let Some(exec_rx) = self.pending_exec_rx.take() else {
+                return;
+            };
+            *folders_lock(&self.folders) = KnownFolders::resolve();
+            let cfg = Arc::new(cfg_lock(&self.cfg).clone());
+            self.watch = Some(crate::watch::start_watch(
+                cfg,
+                Arc::clone(&self.state),
+                Arc::clone(&self.candidates),
+                cmd_rx,
+            ));
+            self.stab = Some(crate::stabilize::start_stabilize(
+                Arc::clone(&self.cfg),
+                Arc::clone(&self.candidates),
+                Arc::clone(&self.paused),
+                Arc::clone(&self.shutdown),
+                Arc::clone(&self.folders),
+                self.paths.undo_file(),
+                self.paths.state_file(),
+                Arc::clone(&self.state),
+                Arc::clone(&self.archived_today),
+                exec_rx,
+            ));
+        }
+
         fn request_quit(&mut self) {
+            self.quitting = true;
             self.remove_icon();
             let _ = self.watch_tx.send(WatchCmd::Shutdown);
             self.shutdown.store(true, Ordering::Relaxed);
@@ -646,6 +759,9 @@ mod win {
         }
 
         fn sync_icon(&mut self) {
+            if self.quitting {
+                return;
+            }
             let mut nid = NOTIFYICONDATAW {
                 cbSize: core::mem::size_of::<NOTIFYICONDATAW>() as u32,
                 hWnd: self.hwnd,
@@ -870,5 +986,10 @@ mod tests {
     fn undo_error_is_one_line() {
         assert_eq!(undo_error_text(&UndoError::Empty), "没有可撤销的记录");
         assert!(!undo_error_text(&UndoError::SourceExists).contains('\n'));
+    }
+
+    #[test]
+    fn known_folder_delay_is_fifteen_seconds() {
+        assert_eq!(KF_DELAY_MS, 15_000);
     }
 }
