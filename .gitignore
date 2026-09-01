@@ -1,2 +1,22 @@
+# Cargo
 /target
 **/*.rs.bk
+*.pdb
+
+# 在仓库里跑便携版时产生的运行时文件
+/data/
+/weekcase.exe
+/portable.ini
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*.stackdump
+
+# 编辑器 / IDE
+.idea/
+.vs/
+*.swp
+*.swo
+*~
