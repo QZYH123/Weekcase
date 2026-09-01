@@ -5,8 +5,15 @@
 
 # 在仓库里跑便携版时产生的运行时文件
 /data/
+/logs/
 /weekcase.exe
 /portable.ini
+
+# 日志与运行时状态（滚动：weekcase.log、weekcase.log.1 …）
+*.log
+*.log.[0-9]
+undo.jsonl
+state.json
 
 # Windows
 Thumbs.db
