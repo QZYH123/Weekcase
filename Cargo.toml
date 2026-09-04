@@ -29,6 +29,9 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[build-dependencies]
+embed-resource = "3.0"
+
 [lints.clippy]
 # rust-version 1.80; io::Error::other stabilized in 1.83
 io_other_error = "allow"

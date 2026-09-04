@@ -188,7 +188,7 @@ mod win {
     use std::thread::JoinHandle;
 
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::Graphics::Gdi::HBRUSH;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx,
@@ -235,6 +235,14 @@ mod win {
     const ID_RELOAD: usize = 1007;
     const ID_AUTOSTART: usize = 1008;
     const ID_EXIT: usize = 1009;
+    /// Resource id from `assets/weekcase.rc`.
+    const IDI_WEEKCASE: PCWSTR = PCWSTR(1 as *const u16);
+
+    fn load_app_icon(hinstance: HINSTANCE) -> HICON {
+        unsafe { LoadIconW(Some(hinstance), IDI_WEEKCASE) }
+            .or_else(|_| unsafe { LoadIconW(None, IDI_APPLICATION) })
+            .unwrap_or_default()
+    }
 
     struct Host {
         inner: RefCell<Inner>,
@@ -269,7 +277,7 @@ mod win {
         let hinstance = unsafe { GetModuleHandleW(None) }
             .map(Into::into)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default();
+        let icon = load_app_icon(hinstance);
         let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
 
         let class = WNDCLASSEXW {
@@ -277,6 +285,7 @@ mod win {
             lpfnWndProc: WNDPROC::Some(wndproc),
             hInstance: hinstance,
             hIcon: icon,
+            hIconSm: icon,
             hbrBackground: HBRUSH::default(),
             lpszClassName: w!("WeekcaseTray"),
             ..Default::default()

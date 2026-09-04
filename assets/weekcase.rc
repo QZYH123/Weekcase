@@ -1,0 +1,2 @@
+#define IDI_WEEKCASE 1
+IDI_WEEKCASE ICON "weekcase.ico"
