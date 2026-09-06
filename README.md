@@ -108,6 +108,8 @@ powershell -File scripts/measure-rss.ps1
 
 ## 规格
 
+从零理解项目（讲解，不是规格）：[docs/guide.md](docs/guide.md)。
+
 行为以这些文件为准，不按本文展开：
 
 | 文档 | 内容 |
