@@ -116,6 +116,7 @@ try {
     if ($null -ne $target) {
         Write-Host "using existing weekcase pid=$($target.Id)"
     } else {
+        $env:WEEKCASE_SKIP_FIRST_RUN = '1'
         $child = Start-Process -FilePath $ExePath -WorkingDirectory (Split-Path -Parent $ExePath) -PassThru
         Start-Sleep -Seconds 2
         $child.Refresh()

@@ -61,7 +61,7 @@ impl AppState {
     }
 
     pub fn is_skipped(&self, path: &Path) -> bool {
-        self.skipped.iter().any(|p| p == path)
+        self.skipped.iter().any(|p| same_path(p, path))
     }
 
     pub fn remove_blocked_from(&mut self, from: &Path) {
@@ -77,7 +77,7 @@ impl AppState {
     }
 
     pub fn push_skipped(&mut self, path: PathBuf) {
-        self.skipped.retain(|p| p != &path);
+        self.skipped.retain(|p| !same_path(p, &path));
         if self.skipped.len() >= MAX_SKIPPED {
             self.skipped.remove(0);
         }
@@ -312,6 +312,10 @@ mod tests {
         assert!(state.is_blocked_from(Path::new("C:/Users/a/foo.pdf")));
         assert!(state.is_blocked_from(Path::new(r"c:\users\a\FOO.pdf")));
         assert!(!state.is_blocked_from(Path::new(r"C:\Users\a\foo-1.pdf")));
+        state.push_skipped(PathBuf::from(r"C:\Users\a\skip.pdf"));
+        assert!(state.is_skipped(Path::new("C:/Users/a/skip.pdf")));
+        assert!(state.is_skipped(Path::new(r"c:\users\a\SKIP.pdf")));
+        assert!(!state.is_skipped(Path::new(r"C:\Users\a\skip-1.pdf")));
         state.push_blocked(PathBuf::from("C:/Users/a/foo.pdf"), PathBuf::from(r"D:\x"));
         assert_eq!(state.blocked.len(), 1);
         assert_eq!(state.blocked[0].to, PathBuf::from(r"D:\x"));

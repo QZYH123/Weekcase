@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -12,12 +12,12 @@ use crate::config::Config;
 use crate::execute::{execute_move, undo_last, ExecCmd, ExecError};
 use crate::known_folders::KnownFolders;
 use crate::state::AppState;
+use crate::tray::{FAULT_DISK_FULL, FAULT_NONE, FAULT_SPLIT};
 use crate::watch::{inspect_file, is_ignored, FileInfo, IgnoreSet};
 
 const ZERO_BYTE_MIN_AGE: Duration = Duration::from_secs(60);
 const ERROR_EVERY: Duration = Duration::from_secs(60);
 const MAX_ATTEMPTS: u32 = 5;
-const RETRY_BACKOFF_SECS: &[u64] = &[5, 15, 60];
 
 #[allow(clippy::too_many_arguments)]
 pub fn start_stabilize(
@@ -30,6 +30,7 @@ pub fn start_stabilize(
     state_path: PathBuf,
     state: Arc<Mutex<AppState>>,
     archived_today: Arc<AtomicU32>,
+    fault: Arc<AtomicU8>,
     exec: Receiver<ExecCmd>,
 ) -> JoinHandle<()> {
     let ignore = IgnoreSet::from_process();
@@ -74,6 +75,7 @@ pub fn start_stabilize(
                         undo_path: &undo_path,
                         state_path: &state_path,
                         archived_today: &archived_today,
+                        fault: &fault,
                     };
                     execute_ready(
                         &ctx,
@@ -223,34 +225,19 @@ fn sample(
     if !lock_probe_ok(path) {
         return;
     }
-    if cand.stable_since.is_none() {
-        cand.stable_since = Some(now);
-    }
-    if cand.attempts > 0 && !backoff_elapsed(cand, now) {
-        return;
-    }
-    if cand.attempts >= MAX_ATTEMPTS {
+    // Spec: lock probe success clears attempts so a released writer is moved
+    // on the next tick instead of waiting out 5s/15s/60s backoff.
+    if cand.attempts > 0 {
         cand.attempts = 0;
         cand.last_error_at = None;
+    }
+    if cand.stable_since.is_none() {
+        cand.stable_since = Some(now);
     }
     if paused || !cand.is_ready(now) {
         return;
     }
     ready.push(cand.snapshot(path.to_path_buf()));
-}
-
-fn retry_backoff(attempts: u32) -> Duration {
-    let i = attempts.saturating_sub(1) as usize;
-    Duration::from_secs(*RETRY_BACKOFF_SECS.get(i).unwrap_or(&60))
-}
-
-fn backoff_elapsed(cand: &Candidate, now: SystemTime) -> bool {
-    let Some(at) = cand.last_error_at else {
-        return true;
-    };
-    now.duration_since(at)
-        .map(|d| d >= retry_backoff(cand.attempts))
-        .unwrap_or(true)
 }
 
 fn flush_persist(live: &Mutex<AppState>, path: &Path, retry: &mut bool) {
@@ -283,6 +270,7 @@ struct ReadyCtx<'a> {
     undo_path: &'a Path,
     state_path: &'a Path,
     archived_today: &'a AtomicU32,
+    fault: &'a AtomicU8,
 }
 
 enum Outcome {
@@ -366,6 +354,9 @@ fn apply_outcome(
     match outcome {
         Outcome::Moved => {
             ctx.archived_today.fetch_add(1, Ordering::Relaxed);
+            if ctx.fault.load(Ordering::Relaxed) == FAULT_DISK_FULL {
+                ctx.fault.store(FAULT_NONE, Ordering::Relaxed);
+            }
             remove_candidate(ctx.candidates, path);
             Next::Continue
         }
@@ -409,6 +400,7 @@ fn apply_outcome(
             if limiter.allow("exec_poison") {
                 tracing::error!(path = %path.display(), "move poisoned");
             }
+            ctx.fault.store(FAULT_SPLIT, Ordering::Relaxed);
             poison_candidate(ctx.candidates, path);
             Next::Continue
         }
@@ -425,6 +417,7 @@ fn apply_outcome(
             if limiter.allow("exec_disk_full") {
                 tracing::error!(path = %path.display(), "disk full");
             }
+            ctx.fault.store(FAULT_DISK_FULL, Ordering::Relaxed);
             Next::Stop
         }
         Outcome::Exec(ExecError::SharingViolation)
@@ -620,6 +613,7 @@ mod tests {
         let undo = dir.join("undo.jsonl");
         let state_path = dir.join("state.json");
         let archived_today = AtomicU32::new(0);
+        let fault = AtomicU8::new(FAULT_NONE);
         let ctx = ReadyCtx {
             cfg,
             folders,
@@ -628,6 +622,7 @@ mod tests {
             undo_path: &undo,
             state_path: &state_path,
             archived_today: &archived_today,
+            fault: &fault,
         };
         let mut limiter = LogLimiter::default();
         let mut illegal = HashSet::new();
@@ -647,6 +642,7 @@ mod tests {
         let undo = dir.join("undo.jsonl");
         let state_path = dir.join("state.json");
         let archived_today = AtomicU32::new(0);
+        let fault = AtomicU8::new(FAULT_NONE);
         let ctx = ReadyCtx {
             cfg: &cfg,
             folders: &folders,
@@ -655,6 +651,7 @@ mod tests {
             undo_path: &undo,
             state_path: &state_path,
             archived_today: &archived_today,
+            fault: &fault,
         };
         let mut limiter = LogLimiter::default();
         let mut illegal = HashSet::new();
@@ -761,49 +758,19 @@ mod tests {
     }
 
     #[test]
-    fn execute_failure_backoff_skips_ready() {
+    fn lock_probe_success_zeros_attempts() {
         let dir = temp_dir();
         let (path, info) = insert_file(&dir, "a.pdf", b"x");
         let mut cand = candidate(&info, 0);
-        cand.attempts = 1;
+        cand.attempts = 4;
         cand.last_error_at = Some(SystemTime::now());
         cand.stable_since = Some(UNIX_EPOCH);
         let table = Mutex::new(HashMap::from([(path.clone(), cand)]));
         let ready = tick_once(&table, &ignore(), SystemTime::now(), false);
-        assert!(ready.is_empty());
-        assert_eq!(table.lock().unwrap()[&path].attempts, 1);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn backoff_elapsed_keeps_attempts_under_cap() {
-        let dir = temp_dir();
-        let (path, info) = insert_file(&dir, "a.pdf", b"x");
-        let now = SystemTime::now();
-        let mut cand = candidate(&info, 0);
-        cand.attempts = 2;
-        cand.last_error_at = Some(now - Duration::from_secs(16));
-        cand.stable_since = Some(UNIX_EPOCH);
-        let table = Mutex::new(HashMap::from([(path.clone(), cand)]));
-        let ready = tick_once(&table, &ignore(), now, false);
         assert_eq!(ready.len(), 1);
-        assert_eq!(table.lock().unwrap()[&path].attempts, 2);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn attempts_cap_zeros_after_backoff() {
-        let dir = temp_dir();
-        let (path, info) = insert_file(&dir, "a.pdf", b"x");
-        let now = SystemTime::now();
-        let mut cand = candidate(&info, 0);
-        cand.attempts = MAX_ATTEMPTS;
-        cand.last_error_at = Some(now - Duration::from_secs(61));
-        cand.stable_since = Some(UNIX_EPOCH);
-        let table = Mutex::new(HashMap::from([(path.clone(), cand)]));
-        let ready = tick_once(&table, &ignore(), now, false);
-        assert_eq!(ready.len(), 1);
-        assert_eq!(table.lock().unwrap()[&path].attempts, 0);
+        let c = &table.lock().unwrap()[&path];
+        assert_eq!(c.attempts, 0);
+        assert!(c.last_error_at.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

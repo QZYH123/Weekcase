@@ -181,9 +181,9 @@ flowchart LR
 3. 没有配置则首次对话框；有则读 `config.toml`
 4. 初始化滚动日志、加载 `state.json`、压缩过长的 `undo.jsonl`
 5. 应用开机启动注册表
-6. **T0 进入消息泵，15 秒后再解析 Known Folder 并启动 T1/T2**
+6. **T0 进入消息泵后立刻解析 Known Folder 并启动 T1/T2**；15 秒后再解析一次并重建监视
 
-这 15 秒（`KF_DELAY_MS`）是给 OneDrive / 外壳的 Known Folder 重定向时间。登录瞬间 `FOLDERID_Downloads` 可能还指向旧位置。开机启动用 HKCU Run 键，不写 HKLM，不要求管理员。进程内延迟，而不是再注册一个计划任务。
+立刻启动是为了手动打开时截图不用再空等一轮。15 秒（`KF_DELAY_MS`）是给 OneDrive / 外壳的 Known Folder 重定向时间：登录瞬间 `FOLDERID_Downloads` 可能还指向旧位置。开机启动用 HKCU Run 键，不写 HKLM，不要求管理员。进程内补一次解析，而不是再注册一个计划任务。
 
 Linux 上没有托盘：启动后立刻开 T1/T2，用来跑不依赖 Win32 的单测。产品二进制需要 Windows + MSVC。
 

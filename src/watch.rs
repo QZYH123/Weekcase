@@ -573,9 +573,11 @@ impl WatchRuntime {
             Ok(admits) => {
                 self.sources[i].next_scan =
                     Instant::now() + Duration::from_secs(src.scan_interval_secs);
+                let mut overflow = false;
                 for (path, cand) in admits {
-                    self.upsert_candidate(i, path, cand);
+                    overflow |= self.upsert_candidate(i, path, cand);
                 }
+                self.finish_scan_overflow(include_existing, overflow);
             }
         }
     }
@@ -597,10 +599,36 @@ impl WatchRuntime {
 
     fn note_overflow(&self, source: &str) {
         tracing::warn!(source, "pending_overflow");
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .overflow_unacked = true;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.overflow_unacked {
+            state.overflow_unacked = true;
+            persist_state(&state);
+        }
+    }
+
+    fn finish_scan_overflow(&self, include_existing: bool, overflow: bool) {
+        if overflow {
+            return;
+        }
+        if !include_existing {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.overflow_unacked {
+            return;
+        }
+        state.overflow_unacked = false;
+        persist_state(&state);
+    }
+
+    #[cfg(windows)]
+    fn unskip(&self, path: &Path) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let before = state.skipped.len();
+        state.skipped.retain(|p| !crate::state::same_path(p, path));
+        if state.skipped.len() != before {
+            persist_state(&state);
+        }
     }
 
     fn flush_debounce(&mut self) {
@@ -645,12 +673,15 @@ impl WatchRuntime {
         self.upsert_candidate(i, path, cand);
     }
 
-    fn upsert_candidate(&mut self, i: usize, path: PathBuf, cand: Candidate) {
+    fn upsert_candidate(&mut self, i: usize, path: PathBuf, cand: Candidate) -> bool {
         let mut table = self.candidates.lock().unwrap_or_else(|e| e.into_inner());
         let result = upsert(&mut table, path, cand, self.max_pending, SystemTime::now());
         drop(table);
         if matches!(result, Upsert::Rejected | Upsert::ReplacedOldest) {
             self.note_overflow(&self.sources[i].cfg.id);
+            true
+        } else {
+            false
         }
     }
 
@@ -830,6 +861,17 @@ fn apply_folders(shared: &Mutex<KnownFolders>, slots: &mut [SourceSlot], fresh: 
         if slot.resolved.is_none() {
             slot.resolved = slot.cfg.resolved_path(&fresh);
         }
+    }
+}
+
+fn persist_state(state: &AppState) {
+    match crate::paths::Paths::resolve() {
+        Ok(paths) => {
+            if let Err(err) = state.save(&paths.state_file()) {
+                tracing::error!(%err, "persist state failed");
+            }
+        }
+        Err(err) => tracing::error!(%err, "resolve paths for state failed"),
     }
 }
 
@@ -1324,8 +1366,7 @@ impl WatchRuntime {
                 || action == FILE_ACTION_RENAMED_NEW_NAME.0
             {
                 if action == FILE_ACTION_MODIFIED.0 {
-                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    st.skipped.retain(|p| p != &path);
+                    self.unskip(&path);
                 }
                 self.pending.insert(path, (i, now));
             }

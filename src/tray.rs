@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(not(windows))]
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -29,6 +29,7 @@ pub struct App {
     pub paused: Arc<AtomicBool>,
     pub shutdown: Arc<AtomicBool>,
     pub archived_today: Arc<AtomicU32>,
+    pub fault: Arc<AtomicU8>,
     pub watch: Option<JoinHandle<()>>,
     pub watch_tx: Sender<WatchCmd>,
     pub pending_watch_rx: Option<Receiver<WatchCmd>>,
@@ -88,6 +89,10 @@ pub fn check_archive_root(
     }
 }
 
+pub const FAULT_NONE: u8 = 0;
+pub const FAULT_DISK_FULL: u8 = 1;
+pub const FAULT_SPLIT: u8 = 2;
+
 pub fn deny_text(reason: DenyReason) -> &'static str {
     match reason {
         DenyReason::Unc => "不能使用网络路径",
@@ -102,13 +107,30 @@ pub fn deny_text(reason: DenyReason) -> &'static str {
     }
 }
 
-pub fn tooltip_text(paused: bool, archived_today: u32, overflow: bool) -> String {
+pub fn tooltip_text(
+    paused: bool,
+    archived_today: u32,
+    overflow: bool,
+    booting: bool,
+    fault: u8,
+) -> String {
+    if booting {
+        return "Weekcase · 正在启动".into();
+    }
+    if fault == FAULT_DISK_FULL {
+        return "Weekcase · 磁盘已满".into();
+    }
     if overflow {
-        "有文件没进队，整理未完成".into()
-    } else if paused {
-        format!("已暂停 · 今日已归档 {archived_today}")
+        let pause = if paused { " · 已暂停" } else { "" };
+        return format!("Weekcase · 有文件没进队，整理未完成{pause}");
+    }
+    if fault == FAULT_SPLIT {
+        return "Weekcase · 有文件复制不完整".into();
+    }
+    if paused {
+        format!("Weekcase · 已暂停 · 今日已归档 {archived_today}")
     } else {
-        format!("监视中 · 今日已归档 {archived_today}")
+        format!("Weekcase · 监视中 · 今日已归档 {archived_today}")
     }
 }
 
@@ -182,33 +204,34 @@ mod win {
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
     use std::sync::mpsc::Sender;
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::Graphics::Gdi::HBRUSH;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx,
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     };
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
         FileOpenDialog, IFileDialog, IShellItem, SHCreateItemFromParsingName, ShellExecuteW,
         Shell_NotifyIconW, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, NIF_ICON, NIF_MESSAGE,
-        NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, SIGDN_FILESYSPATH,
+        NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NINF_KEY,
+        NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4, SIGDN_FILESYSPATH,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-        DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer, LoadIconW,
-        MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+        DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer, MessageBoxW,
+        PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
         SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage,
-        CW_USEDEFAULT, GWLP_USERDATA, HICON, IDI_APPLICATION, IDYES, MB_ICONERROR, MB_ICONWARNING,
-        MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNORMAL,
-        TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
-        WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WNDPROC, WS_EX_TOOLWINDOW, WS_POPUP,
+        CW_USEDEFAULT, GWLP_USERDATA, HICON, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING,
+        MB_OK, MB_SETFOREGROUND, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
+        SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU,
+        WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WNDPROC,
+        WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     use super::{
@@ -221,6 +244,7 @@ mod win {
     use crate::paths::Paths;
     use crate::state::AppState;
     use crate::watch::WatchCmd;
+    use crate::win32::{enable_dark_titlebar, init_common_controls, load_app_icon};
 
     const WM_TRAY: u32 = WM_APP + 1;
     const TRAY_ID: u32 = 1;
@@ -232,17 +256,10 @@ mod win {
     const ID_PICK: usize = 1004;
     const ID_OPEN_ROOT: usize = 1005;
     const ID_OPEN_LOG: usize = 1006;
+    const ID_OPEN_CFG: usize = 1010;
     const ID_RELOAD: usize = 1007;
     const ID_AUTOSTART: usize = 1008;
     const ID_EXIT: usize = 1009;
-    /// Resource id from `assets/weekcase.rc`.
-    const IDI_WEEKCASE: PCWSTR = PCWSTR(1 as *const u16);
-
-    fn load_app_icon(hinstance: HINSTANCE) -> HICON {
-        unsafe { LoadIconW(Some(hinstance), IDI_WEEKCASE) }
-            .or_else(|_| unsafe { LoadIconW(None, IDI_APPLICATION) })
-            .unwrap_or_default()
-    }
 
     struct Host {
         inner: RefCell<Inner>,
@@ -257,6 +274,7 @@ mod win {
         paused: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
         archived_today: Arc<AtomicU32>,
+        fault: Arc<AtomicU8>,
         watch: Option<JoinHandle<()>>,
         watch_tx: Sender<WatchCmd>,
         pending_watch_rx: Option<std::sync::mpsc::Receiver<WatchCmd>>,
@@ -271,13 +289,11 @@ mod win {
     }
 
     pub fn run(app: App) -> io::Result<ExitCode> {
+        init_common_controls();
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         let com_owned = hr.0 == 0;
 
-        let hinstance = unsafe { GetModuleHandleW(None) }
-            .map(Into::into)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let icon = load_app_icon(hinstance);
+        let (hinstance, icon) = load_app_icon()?;
         let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
 
         let class = WNDCLASSEXW {
@@ -307,6 +323,7 @@ mod win {
                 paused: app.paused,
                 shutdown: app.shutdown,
                 archived_today: app.archived_today,
+                fault: app.fault,
                 watch: app.watch,
                 watch_tx: app.watch_tx,
                 pending_watch_rx: app.pending_watch_rx,
@@ -345,6 +362,8 @@ mod win {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, host_ptr as isize);
         }
         host.inner.borrow_mut().hwnd = hwnd;
+        enable_dark_titlebar(hwnd);
+        host.inner.borrow_mut().boot_pipeline();
         host.inner.borrow_mut().sync_icon();
         unsafe {
             SetTimer(Some(hwnd), TIMER_TIP, 2000, None);
@@ -423,15 +442,24 @@ mod win {
                 WM_TIMER => {
                     if wparam.0 == TIMER_BOOT {
                         let _ = unsafe { KillTimer(Some(hwnd), TIMER_BOOT) };
-                        self.boot_pipeline();
+                        if self.watch.is_none() {
+                            self.boot_pipeline();
+                        } else {
+                            self.refresh_known_folders();
+                        }
                     } else {
                         self.sync_icon();
                     }
                     LRESULT(0)
                 }
                 m if m == WM_TRAY => {
-                    let event = lparam.0 as u32;
-                    if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
+                    let event = (lparam.0 as u32) & 0xFFFF;
+                    if event == WM_RBUTTONUP
+                        || event == WM_LBUTTONUP
+                        || event == WM_CONTEXTMENU
+                        || event == NIN_SELECT
+                        || event == (NIN_SELECT | NINF_KEY)
+                    {
                         self.popup_menu();
                     }
                     LRESULT(0)
@@ -447,7 +475,7 @@ mod win {
             };
             let paused = self.paused.load(Ordering::Relaxed);
             let pause_label = if paused {
-                w!("恢复")
+                w!("继续归档")
             } else {
                 w!("暂停归档")
             };
@@ -474,8 +502,9 @@ mod win {
                 let _ = AppendMenuW(menu, MF_STRING, ID_SWEEP, w!("整理现有文件"));
                 let _ = AppendMenuW(menu, MF_STRING, ID_PICK, w!("选择归档文件夹"));
                 let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_ROOT, w!("打开归档文件夹"));
-                let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_LOG, w!("打开日志"));
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_CFG, w!("打开配置"));
+                let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_LOG, w!("打开日志"));
                 let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, w!("重新加载配置"));
                 let _ = AppendMenuW(menu, autostart_flags, ID_AUTOSTART, w!("开机启动"));
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -509,6 +538,7 @@ mod win {
                 ID_SWEEP => self.sweep_existing(),
                 ID_PICK => self.pick_root(),
                 ID_OPEN_ROOT => self.open_root(),
+                ID_OPEN_CFG => self.open_config(),
                 ID_OPEN_LOG => self.open_path(&self.paths.log_file()),
                 ID_RELOAD => self.reload_config(),
                 ID_AUTOSTART => self.toggle_autostart(),
@@ -529,6 +559,7 @@ mod win {
                 crate::config::persist_bool(&self.paths.config_file(), "general", "paused", next)
             {
                 tracing::error!(%err, "persist paused failed");
+                self.error("已切换暂停，但未能写入配置文件");
             }
         }
 
@@ -560,7 +591,7 @@ mod win {
             use std::time::Duration;
 
             if !self.confirm(
-                "将按当前规则移动两个源目录顶层的已有文件（含未满 7 天的下载），可随后撤销。继续？",
+                "将按当前规则移动两个源目录顶层的已有文件（含未满 7 天的下载），可随后撤销。一次最多 256 个，可再点一次。继续？",
             ) {
                 return;
             }
@@ -617,6 +648,7 @@ mod win {
                 &root,
             ) {
                 tracing::error!(%err, "persist destination.root failed");
+                self.error("归档目录已切换，但未能写入配置文件");
             }
             self.unpoison_and_rescan();
         }
@@ -652,6 +684,22 @@ mod win {
             };
             if inst.0 as isize <= 32 {
                 tracing::error!(path = %path.display(), "ShellExecuteW failed");
+                self.error(&format!("无法打开：{}", path.display()));
+            }
+        }
+
+        fn open_config(&mut self) {
+            let path = self.paths.config_file();
+            if path.is_file() {
+                self.open_path(&path);
+                return;
+            }
+            if let Some(dir) = path.parent() {
+                if let Err(err) = std::fs::create_dir_all(dir) {
+                    self.error(&format!("无法打开配置：{err}"));
+                    return;
+                }
+                self.open_path(dir);
             }
         }
 
@@ -663,6 +711,7 @@ mod win {
                         tracing::error!(%err, "autostart apply failed");
                     }
                     *cfg_lock(&self.cfg) = new;
+                    self.drop_disabled_candidates();
                     self.rebuild_watch();
                     self.unpoison_and_rescan();
                 }
@@ -684,7 +733,26 @@ mod win {
                 next,
             ) {
                 tracing::error!(%err, "persist start_with_windows failed");
+                self.error("开机启动已更新，但未能写入配置文件");
             }
+        }
+
+        fn drop_disabled_candidates(&mut self) {
+            let ids: std::collections::HashSet<String> = cfg_lock(&self.cfg)
+                .sources
+                .iter()
+                .filter(|s| s.enabled)
+                .map(|s| s.id.clone())
+                .collect();
+            self.candidates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|_, c| ids.contains(&c.source_id));
+        }
+
+        fn refresh_known_folders(&mut self) {
+            *folders_lock(&self.folders) = KnownFolders::resolve();
+            self.rebuild_watch();
         }
 
         fn rebuild_watch(&mut self) {
@@ -749,6 +817,7 @@ mod win {
                 self.paths.state_file(),
                 Arc::clone(&self.state),
                 Arc::clone(&self.archived_today),
+                Arc::clone(&self.fault),
                 exec_rx,
             ));
         }
@@ -768,6 +837,8 @@ mod win {
                 self.paused.load(Ordering::Relaxed),
                 self.archived_today.load(Ordering::Relaxed),
                 state_lock(&self.state).overflow_unacked,
+                self.watch.is_none(),
+                self.fault.load(Ordering::Relaxed),
             )
         }
 
@@ -787,10 +858,10 @@ mod win {
             copy_tip(&mut nid.szTip, &self.tooltip());
             if self.icon_added {
                 if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) }.as_bool() {
-                    self.icon_added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool();
+                    self.icon_added = add_icon(&mut nid);
                 }
             } else {
-                self.icon_added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) }.as_bool();
+                self.icon_added = add_icon(&mut nid);
             }
         }
 
@@ -825,6 +896,15 @@ mod win {
         folders
     }
 
+    fn add_icon(nid: &mut NOTIFYICONDATAW) -> bool {
+        if !unsafe { Shell_NotifyIconW(NIM_ADD, nid) }.as_bool() {
+            return false;
+        }
+        nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+        let _ = unsafe { Shell_NotifyIconW(NIM_SETVERSION, nid) };
+        true
+    }
+
     fn copy_tip(dst: &mut [u16; 128], text: &str) {
         dst.fill(0);
         for (i, unit) in text.encode_utf16().take(127).enumerate() {
@@ -835,9 +915,9 @@ mod win {
     pub fn message_box(hwnd: Option<HWND>, text: &str, confirm: bool) -> bool {
         let wide: Vec<u16> = text.encode_utf16().chain(core::iter::once(0)).collect();
         let flags = if confirm {
-            MB_YESNO | MB_ICONWARNING
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND
         } else {
-            MB_OK | MB_ICONERROR
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND
         };
         let rc = unsafe { MessageBoxW(hwnd, PCWSTR(wide.as_ptr()), w!("Weekcase"), flags) };
         !confirm || rc == IDYES
@@ -961,9 +1041,29 @@ mod tests {
 
     #[test]
     fn tooltip_empty_paused_and_overflow() {
-        assert_eq!(tooltip_text(false, 0, false), "监视中 · 今日已归档 0");
-        assert_eq!(tooltip_text(true, 3, false), "已暂停 · 今日已归档 3");
-        assert_eq!(tooltip_text(false, 1, true), "有文件没进队，整理未完成");
+        assert_eq!(
+            tooltip_text(false, 0, false, false, FAULT_NONE),
+            "Weekcase · 监视中 · 今日已归档 0"
+        );
+        assert_eq!(
+            tooltip_text(true, 3, false, false, FAULT_NONE),
+            "Weekcase · 已暂停 · 今日已归档 3"
+        );
+        let overflow = tooltip_text(false, 1, true, false, FAULT_NONE);
+        assert!(overflow.contains("有文件没进队，整理未完成"));
+        assert!(tooltip_text(true, 1, true, false, FAULT_NONE).contains("已暂停"));
+        assert_eq!(
+            tooltip_text(false, 0, false, true, FAULT_NONE),
+            "Weekcase · 正在启动"
+        );
+        assert_eq!(
+            tooltip_text(false, 0, false, false, FAULT_DISK_FULL),
+            "Weekcase · 磁盘已满"
+        );
+        assert_eq!(
+            tooltip_text(false, 0, false, false, FAULT_SPLIT),
+            "Weekcase · 有文件复制不完整"
+        );
     }
 
     #[test]

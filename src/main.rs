@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::SystemTime;
 
@@ -70,6 +70,7 @@ fn run() -> io::Result<ExitCode> {
     let paused = Arc::new(AtomicBool::new(cfg.general.paused));
     let shutdown = Arc::new(AtomicBool::new(false));
     let archived_today = Arc::new(AtomicU32::new(0));
+    let fault = Arc::new(AtomicU8::new(tray::FAULT_NONE));
     #[cfg(windows)]
     if let Err(err) = tray::apply_autostart(cfg.general.start_with_windows) {
         tracing::error!(%err, "autostart apply failed");
@@ -114,6 +115,7 @@ fn run() -> io::Result<ExitCode> {
             paths.state_file(),
             Arc::clone(&state),
             Arc::clone(&archived_today),
+            Arc::clone(&fault),
             exec_rx,
         );
         (Some(watch), Some(stab), None, None)
@@ -144,6 +146,7 @@ fn run() -> io::Result<ExitCode> {
         paused,
         shutdown,
         archived_today,
+        fault,
         watch,
         watch_tx: cmd_tx,
         pending_watch_rx,

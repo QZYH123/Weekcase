@@ -16,13 +16,19 @@ pub const MISSING_SOURCE: &str = "尚未创建，出现后自动监视";
 pub const ONEDRIVE_WARNING: &str =
     "警告：该路径由 OneDrive 同步。归档会上传到云端。建议改到本地磁盘。";
 
+pub const FIRST_RUN_TITLE: &str = "归档下载和截图";
+
+pub const FIRST_RUN_SUBTITLE: &str =
+    "文件写完并过了冷静期后才会移动。默认不会收拾已经在文件夹里的旧文件。";
+
 pub const FIRST_RUN_LINES: &[&str] = &[
-    "默认不会移动已经在文件夹里的旧文件。",
     "下载会在原文件夹里大约留 7 天再归档（刚下的还能打开）。",
     "截图大约几十秒后归档。",
     "之后可以从托盘选择「整理现有文件」来立刻收旧文件。",
     "本程序会随 Windows 登录启动（可在托盘关掉）。",
 ];
+
+pub const TRAY_HINT: &str = "开始后，请到任务栏右下角（隐藏图标）找到 Weekcase。";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirstRun {
@@ -119,41 +125,41 @@ mod win {
     use std::path::PathBuf;
 
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Foundation::{
+        GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+    };
     use windows::Win32::Graphics::Gdi::{
-        GetStockObject, GetSysColorBrush, COLOR_WINDOW, DEFAULT_GUI_FONT,
+        GetSysColor, GetSysColorBrush, SetBkColor, SetTextColor, COLOR_GRAYTEXT, COLOR_INFOBK,
+        COLOR_INFOTEXT, COLOR_WINDOW, HDC,
     };
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetMessageW, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW, MessageBoxW,
-        PostQuitMessage, RegisterClassExW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
-        SetWindowTextW, ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON, CW_USEDEFAULT,
-        ES_AUTOHSCROLL, ES_READONLY, GWLP_USERDATA, HMENU, IDC_ARROW, MB_ICONERROR, MB_OK, MSG,
-        SW_HIDE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-        WM_SETFONT, WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-        WS_EX_CONTROLPARENT, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+        GetWindowLongPtrW, IsDialogMessageW, LoadCursorW, MessageBoxW, PostQuitMessage,
+        RegisterClassExW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+        TranslateMessage, BS_DEFPUSHBUTTON, ES_AUTOHSCROLL, ES_READONLY, GWLP_USERDATA, HMENU,
+        IDC_ARROW, MB_ICONERROR, MB_OK, MSG, SW_HIDE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_DESTROY, WNDCLASSEXW, WNDPROC, WS_CAPTION,
+        WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+        WS_VISIBLE,
     };
 
     use super::{
         needs_onedrive_warning, source_watch_line, watch_sources, FirstRun, FIRST_RUN_LINES,
-        ONEDRIVE_WARNING,
+        FIRST_RUN_SUBTITLE, FIRST_RUN_TITLE, ONEDRIVE_WARNING, TRAY_HINT,
     };
     use crate::known_folders::KnownFolders;
     use crate::tray::{check_archive_root, deny_text, pick_archive_folder};
+    use crate::win32::{
+        apply_font, center_in, cursor_work_area_dpi, enable_dark_titlebar, init_common_controls,
+        load_app_icon, scale, window_size_for_client, Fonts,
+    };
 
     const ID_START: u32 = 1;
     const ID_EXIT: u32 = 2;
     const ID_BROWSE: u32 = 100;
-    const CLIENT_W: i32 = 520;
-    const MARGIN: i32 = 20;
-    const LINE: i32 = 22;
-    const EDIT_H: i32 = 24;
-    const BTN_W: i32 = 88;
-    const BTN_H: i32 = 28;
-    const BROWSE_W: i32 = 80;
-    const WARN_H: i32 = 40;
+    const SS_NOPREFIX: u32 = 0x80;
+    const SS_ENDELLIPSIS: u32 = 0x4000;
 
     struct Host {
         inner: RefCell<Inner>,
@@ -166,10 +172,68 @@ mod win {
         result: Option<FirstRun>,
         hwnd: HWND,
         edit: HWND,
-        warn: HWND,
+        subtitle: HWND,
+        footer: HWND,
+        warn: bool,
+        fonts: Option<Fonts>,
+    }
+
+    struct Layout {
+        dpi: u32,
+        client_w: i32,
+        margin: i32,
+        line: i32,
+        edit_h: i32,
+        btn_w: i32,
+        btn_h: i32,
+        browse_w: i32,
+        footer_h: i32,
+        client_h: i32,
+    }
+
+    impl Layout {
+        fn new(dpi: u32) -> Self {
+            let s = |px| scale(dpi, px);
+            let margin = s(24);
+            let line = s(22);
+            let edit_h = s(26);
+            let btn_h = s(32);
+            let footer_h = s(40);
+            let notes = FIRST_RUN_LINES.len() as i32;
+            let client_h = s(24)
+                + s(28)
+                + s(6)
+                + s(40)
+                + s(18)
+                + s(20)
+                + line * 2
+                + s(16)
+                + s(20)
+                + edit_h
+                + s(16)
+                + line * notes
+                + s(12)
+                + footer_h
+                + s(16)
+                + btn_h
+                + s(20);
+            Self {
+                dpi,
+                client_w: s(500),
+                margin,
+                line,
+                edit_h,
+                btn_w: s(96),
+                btn_h,
+                browse_w: s(88),
+                footer_h,
+                client_h,
+            }
+        }
     }
 
     pub fn run(folders: &KnownFolders) -> io::Result<FirstRun> {
+        init_common_controls();
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
         let com_owned = hr.0 == 0;
         let result = run_dialog(folders);
@@ -182,36 +246,34 @@ mod win {
     }
 
     fn run_dialog(folders: &KnownFolders) -> io::Result<FirstRun> {
-        let hinstance = unsafe { GetModuleHandleW(None) }
-            .map(Into::into)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let (hinstance, icon) = load_app_icon()?;
         let class = WNDCLASSEXW {
             cbSize: core::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: WNDPROC::Some(wndproc),
             hInstance: hinstance,
+            hIcon: icon,
+            hIconSm: icon,
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
             hbrBackground: unsafe { GetSysColorBrush(COLOR_WINDOW) },
             lpszClassName: w!("WeekcaseFirstRun"),
             ..Default::default()
         };
-        if unsafe { RegisterClassExW(&class) } == 0 {
+        if unsafe { RegisterClassExW(&class) } == 0
+            && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "RegisterClassExW failed",
             ));
         }
 
+        let (work, dpi) = cursor_work_area_dpi();
+        let layout = Layout::new(dpi);
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
         let ex = WS_EX_CONTROLPARENT;
-        let mut rc = RECT {
-            left: 0,
-            top: 0,
-            right: CLIENT_W,
-            bottom: dialog_height(),
-        };
-        unsafe {
-            let _ = AdjustWindowRectEx(&mut rc, style, false, ex);
-        }
+        let (win_w, win_h) =
+            window_size_for_client(layout.client_w, layout.client_h, style, ex, dpi);
+        let pos = center_in(work, win_w, win_h);
 
         let mut host = Box::new(Host {
             inner: RefCell::new(Inner {
@@ -221,7 +283,10 @@ mod win {
                 result: None,
                 hwnd: HWND::default(),
                 edit: HWND::default(),
-                warn: HWND::default(),
+                subtitle: HWND::default(),
+                footer: HWND::default(),
+                warn: false,
+                fonts: Some(Fonts::new(dpi)),
             }),
         });
         let host_ptr = host.as_mut() as *mut Host;
@@ -231,10 +296,10 @@ mod win {
                 w!("WeekcaseFirstRun"),
                 w!("Weekcase"),
                 style,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                rc.right - rc.left,
-                rc.bottom - rc.top,
+                pos.x,
+                pos.y,
+                win_w,
+                win_h,
                 None,
                 None,
                 Some(hinstance),
@@ -245,11 +310,28 @@ mod win {
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, host_ptr as isize);
         }
+        enable_dark_titlebar(hwnd);
 
         let downloads = source_watch_line("下载", folders.downloads.as_deref());
         let screenshots = source_watch_line("截图", folders.screenshots.as_deref());
-        let (edit, warn) = match create_controls(hwnd, hinstance, &downloads, &screenshots) {
-            Ok(pair) => pair,
+        let fonts_body;
+        let fonts_title;
+        {
+            let inner = host.inner.borrow();
+            let fonts = inner.fonts.as_ref().expect("fonts");
+            fonts_body = fonts.body;
+            fonts_title = fonts.title;
+        }
+        let widgets = match create_controls(
+            hwnd,
+            hinstance,
+            &layout,
+            fonts_title,
+            fonts_body,
+            &downloads,
+            &screenshots,
+        ) {
+            Ok(w) => w,
             Err(err) => {
                 unsafe {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -261,8 +343,9 @@ mod win {
         {
             let mut inner = host.inner.borrow_mut();
             inner.hwnd = hwnd;
-            inner.edit = edit;
-            inner.warn = warn;
+            inner.edit = widgets.edit;
+            inner.subtitle = widgets.subtitle;
+            inner.footer = widgets.footer;
             inner.sync_widgets();
         }
         unsafe {
@@ -287,93 +370,118 @@ mod win {
         Ok(inner.into_inner().result.unwrap_or(FirstRun::Exit))
     }
 
-    fn dialog_height() -> i32 {
-        16 + LINE * 3
-            + 8
-            + LINE
-            + EDIT_H
-            + 16
-            + LINE * FIRST_RUN_LINES.len() as i32
-            + 8
-            + WARN_H
-            + 16
-            + BTN_H
-            + 20
+    struct Widgets {
+        edit: HWND,
+        subtitle: HWND,
+        footer: HWND,
     }
 
     fn create_controls(
         hwnd: HWND,
         hinstance: windows::Win32::Foundation::HINSTANCE,
+        layout: &Layout,
+        title_font: windows::Win32::Graphics::Gdi::HFONT,
+        body_font: windows::Win32::Graphics::Gdi::HFONT,
         downloads: &str,
         screenshots: &str,
-    ) -> io::Result<(HWND, HWND)> {
-        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) }.0 as isize;
-        let mut y = 16;
-        let text_w = CLIENT_W - MARGIN * 2;
+    ) -> io::Result<Widgets> {
+        let s = |px| scale(layout.dpi, px);
+        let text_w = layout.client_w - layout.margin * 2;
+        let mut y = s(24);
         child(
             hwnd,
             hinstance,
-            font,
+            title_font,
             w!("STATIC"),
-            "Weekcase 将监视：",
-            WS_CHILD | WS_VISIBLE,
+            FIRST_RUN_TITLE,
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_NOPREFIX),
             WINDOW_EX_STYLE(0),
-            MARGIN,
+            layout.margin,
             y,
             text_w,
-            LINE,
+            s(28),
             0,
         )?;
-        y += LINE;
-        child(
+        y += s(28) + s(6);
+        let subtitle = child(
             hwnd,
             hinstance,
-            font,
+            body_font,
             w!("STATIC"),
-            downloads,
-            WS_CHILD | WS_VISIBLE,
+            FIRST_RUN_SUBTITLE,
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_NOPREFIX),
             WINDOW_EX_STYLE(0),
-            MARGIN,
+            layout.margin,
             y,
             text_w,
-            LINE,
+            s(40),
             0,
         )?;
-        y += LINE;
+        y += s(40) + s(18);
         child(
             hwnd,
             hinstance,
-            font,
+            body_font,
+            w!("STATIC"),
+            "监视",
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_NOPREFIX),
+            WINDOW_EX_STYLE(0),
+            layout.margin,
+            y,
+            text_w,
+            s(20),
+            0,
+        )?;
+        y += s(20);
+        child(
+            hwnd,
+            hinstance,
+            body_font,
+            w!("STATIC"),
+            &downloads,
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_NOPREFIX | SS_ENDELLIPSIS),
+            WINDOW_EX_STYLE(0),
+            layout.margin,
+            y,
+            text_w,
+            layout.line,
+            0,
+        )?;
+        y += layout.line;
+        child(
+            hwnd,
+            hinstance,
+            body_font,
             w!("STATIC"),
             screenshots,
-            WS_CHILD | WS_VISIBLE,
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_NOPREFIX | SS_ENDELLIPSIS),
             WINDOW_EX_STYLE(0),
-            MARGIN,
+            layout.margin,
             y,
             text_w,
-            LINE,
+            layout.line,
             0,
         )?;
-        y += LINE + 8;
+        y += layout.line + s(16);
         child(
             hwnd,
             hinstance,
-            font,
+            body_font,
             w!("STATIC"),
-            "归档到：",
-            WS_CHILD | WS_VISIBLE,
+            "归档到",
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_NOPREFIX),
             WINDOW_EX_STYLE(0),
-            MARGIN,
+            layout.margin,
             y,
             text_w,
-            LINE,
+            s(20),
             0,
         )?;
-        y += LINE;
+        y += s(20);
         let edit = child(
             hwnd,
             hinstance,
-            font,
+            body_font,
             w!("EDIT"),
             "",
             WS_CHILD
@@ -381,96 +489,100 @@ mod win {
                 | WS_TABSTOP
                 | WINDOW_STYLE((ES_READONLY | ES_AUTOHSCROLL) as u32),
             WS_EX_CLIENTEDGE,
-            MARGIN,
+            layout.margin,
             y,
-            text_w - BROWSE_W - 8,
-            EDIT_H,
+            text_w - layout.browse_w - s(8),
+            layout.edit_h,
             0,
         )?;
         child(
             hwnd,
             hinstance,
-            font,
+            body_font,
             w!("BUTTON"),
-            "浏览…",
+            "浏览(&B)…",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             WINDOW_EX_STYLE(0),
-            CLIENT_W - MARGIN - BROWSE_W,
+            layout.client_w - layout.margin - layout.browse_w,
             y,
-            BROWSE_W,
-            EDIT_H,
+            layout.browse_w,
+            layout.edit_h,
             ID_BROWSE as i32,
         )?;
-        y += EDIT_H + 16;
+        y += layout.edit_h + s(16);
         for line in FIRST_RUN_LINES {
             child(
                 hwnd,
                 hinstance,
-                font,
+                body_font,
                 w!("STATIC"),
                 line,
-                WS_CHILD | WS_VISIBLE,
+                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_NOPREFIX | SS_ENDELLIPSIS),
                 WINDOW_EX_STYLE(0),
-                MARGIN,
+                layout.margin,
                 y,
                 text_w,
-                LINE,
+                layout.line,
                 0,
             )?;
-            y += LINE;
+            y += layout.line;
         }
-        y += 8;
-        let warn = child(
+        y += s(12);
+        let footer = child(
             hwnd,
             hinstance,
-            font,
+            body_font,
             w!("STATIC"),
-            "",
-            WS_CHILD | WS_VISIBLE,
+            TRAY_HINT,
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_NOPREFIX),
             WINDOW_EX_STYLE(0),
-            MARGIN,
+            layout.margin,
             y,
             text_w,
-            WARN_H,
+            layout.footer_h,
             0,
         )?;
-        y += WARN_H + 16;
+        y += layout.footer_h + s(16);
         child(
             hwnd,
             hinstance,
-            font,
+            body_font,
             w!("BUTTON"),
-            "开始",
+            "开始(&S)",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
             WINDOW_EX_STYLE(0),
-            CLIENT_W - MARGIN - BTN_W * 2 - 12,
+            layout.client_w - layout.margin - layout.btn_w * 2 - s(12),
             y,
-            BTN_W,
-            BTN_H,
+            layout.btn_w,
+            layout.btn_h,
             ID_START as i32,
         )?;
         child(
             hwnd,
             hinstance,
-            font,
+            body_font,
             w!("BUTTON"),
-            "退出",
+            "退出(&X)",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             WINDOW_EX_STYLE(0),
-            CLIENT_W - MARGIN - BTN_W,
+            layout.client_w - layout.margin - layout.btn_w,
             y,
-            BTN_W,
-            BTN_H,
+            layout.btn_w,
+            layout.btn_h,
             ID_EXIT as i32,
         )?;
-        Ok((edit, warn))
+        Ok(Widgets {
+            edit,
+            subtitle,
+            footer,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn child(
         parent: HWND,
         hinstance: windows::Win32::Foundation::HINSTANCE,
-        font: isize,
+        font: windows::Win32::Graphics::Gdi::HFONT,
         class: PCWSTR,
         text: &str,
         style: WINDOW_STYLE,
@@ -499,14 +611,7 @@ mod win {
             )
         }
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        unsafe {
-            SendMessageW(
-                hwnd,
-                WM_SETFONT,
-                Some(WPARAM(font as usize)),
-                Some(LPARAM(1)),
-            );
-        }
+        apply_font(hwnd, font);
         Ok(hwnd)
     }
 
@@ -545,13 +650,38 @@ mod win {
                     }
                     LRESULT(0)
                 }
+                WM_CTLCOLORSTATIC => self.color_static(wparam, lparam),
                 WM_CLOSE => {
                     self.dismiss();
                     LRESULT(0)
                 }
-                WM_DESTROY => LRESULT(0),
+                WM_DESTROY => {
+                    self.fonts = None;
+                    LRESULT(0)
+                }
                 _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
             }
+        }
+
+        fn color_static(&self, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+            let child = HWND(lparam.0 as *mut core::ffi::c_void);
+            let (text, back, brush) = if child.0 == self.footer.0 && self.warn {
+                (COLOR_INFOTEXT, COLOR_INFOBK, unsafe {
+                    GetSysColorBrush(COLOR_INFOBK)
+                })
+            } else if child.0 == self.subtitle.0 || child.0 == self.footer.0 {
+                (COLOR_GRAYTEXT, COLOR_WINDOW, unsafe {
+                    GetSysColorBrush(COLOR_WINDOW)
+                })
+            } else {
+                return unsafe { DefWindowProcW(self.hwnd, WM_CTLCOLORSTATIC, wparam, lparam) };
+            };
+            unsafe {
+                SetTextColor(hdc, COLORREF(GetSysColor(text)));
+                SetBkColor(hdc, COLORREF(GetSysColor(back)));
+            }
+            LRESULT(brush.0 as isize)
         }
 
         fn accept(&mut self) {
@@ -600,16 +730,18 @@ mod win {
             }
         }
 
-        fn sync_widgets(&self) {
+        fn sync_widgets(&mut self) {
             set_text(self.edit, &self.root.to_string_lossy());
-            let warn = if !self.root.as_os_str().is_empty()
-                && needs_onedrive_warning(&self.root, &self.sources, &self.folders)
-            {
-                ONEDRIVE_WARNING
-            } else {
-                ""
-            };
-            set_text(self.warn, warn);
+            self.warn = !self.root.as_os_str().is_empty()
+                && needs_onedrive_warning(&self.root, &self.sources, &self.folders);
+            set_text(
+                self.footer,
+                if self.warn {
+                    ONEDRIVE_WARNING
+                } else {
+                    TRAY_HINT
+                },
+            );
         }
 
         fn error(&self, text: &str) {
@@ -713,10 +845,17 @@ mod tests {
 
     #[test]
     fn copy_covers_existing_files_and_autostart() {
-        let text = FIRST_RUN_LINES.join("");
-        assert!(text.contains("默认不会移动已经在文件夹里的旧文件"));
+        let text = format!(
+            "{}{}{}",
+            FIRST_RUN_SUBTITLE,
+            FIRST_RUN_LINES.join(""),
+            TRAY_HINT
+        );
+        assert!(text.contains("默认不会收拾已经在文件夹里的旧文件"));
         assert!(text.contains("整理现有文件"));
         assert!(text.contains("随 Windows 登录启动"));
+        assert!(text.contains("任务栏右下角"));
+        assert!(FIRST_RUN_TITLE.contains("归档"));
         assert!(ONEDRIVE_WARNING.contains("OneDrive"));
     }
 

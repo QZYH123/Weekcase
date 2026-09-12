@@ -11,3 +11,5 @@ pub mod state;
 pub mod tray;
 pub mod undo;
 pub mod watch;
+#[cfg(windows)]
+pub(crate) mod win32;

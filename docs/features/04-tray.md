@@ -64,7 +64,7 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 
 便携模式同样写绝对路径。卸载/退出时若用户关掉勾选则删值。
 
-若实现者改用计划任务：`schtasks` 对当前用户 `/SC ONLOGON /DELAY 0000:15`，不要求管理员。二选一，不要两个都注册。**推荐 Run 键**：实现简单；OneDrive 竞态用进程内 15 s 延迟解析 Known Folder（R10）。
+若实现者改用计划任务：`schtasks` 对当前用户 `/SC ONLOGON /DELAY 0000:15`，不要求管理员。二选一，不要两个都注册。**推荐 Run 键**：实现简单；进程立刻开始监视，15 s 后再解析一次 Known Folder（R10，防登录时 OneDrive 重定向）。
 
 ### 空状态
 
