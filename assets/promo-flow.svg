@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="360" viewBox="0 0 960 360" role="img" aria-label="下载约留 7 天，截图几十秒后按月归档">
+  <title>Weekcase 怎么工作</title>
+  <rect width="960" height="360" rx="28" fill="#2f2f2f"/>
+  <!-- 下载 -->
+  <g transform="translate(48,56)">
+    <rect width="240" height="248" rx="20" fill="#3a3a3a"/>
+    <text x="120" y="36" text-anchor="middle" fill="#f4f4f4" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="600">下载</text>
+    <text x="120" y="62" text-anchor="middle" fill="#c8c8c8" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="13">大约留 7 天</text>
+    <g fill="none" stroke="#f4f4f4" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="70" y="96" width="100" height="78" rx="8"/>
+      <path d="M88 96v-10h40l16 16v72"/>
+    </g>
+    <text x="120" y="210" text-anchor="middle" fill="#d8d8d8" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="13">安装包还能双击</text>
+    <text x="120" y="230" text-anchor="middle" fill="#d8d8d8" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="13">再按类型归档</text>
+  </g>
+  <path d="M304 180h52" fill="none" stroke="#f4f4f4" stroke-width="6" stroke-linecap="round"/>
+  <path d="M348 168l16 12-16 12" fill="none" stroke="#f4f4f4" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 截图 -->
+  <g transform="translate(360,56)">
+    <rect width="240" height="248" rx="20" fill="#3a3a3a"/>
+    <text x="120" y="36" text-anchor="middle" fill="#f4f4f4" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="600">截图</text>
+    <text x="120" y="62" text-anchor="middle" fill="#c8c8c8" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="13">大约几十秒</text>
+    <g fill="none" stroke="#f4f4f4" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="64" y="96" width="112" height="80" rx="10"/>
+      <circle cx="92" cy="124" r="8"/>
+      <path d="M76 160l24-22 20 16 20-28 36 34"/>
+    </g>
+    <text x="120" y="210" text-anchor="middle" fill="#d8d8d8" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="13">按拍摄月份进箱</text>
+    <text x="120" y="230" text-anchor="middle" fill="#d8d8d8" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="13">例如 2026-09</text>
+  </g>
+  <path d="M616 180h52" fill="none" stroke="#f4f4f4" stroke-width="6" stroke-linecap="round"/>
+  <path d="M660 168l16 12-16 12" fill="none" stroke="#f4f4f4" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 归档 -->
+  <g transform="translate(672,56)">
+    <rect width="240" height="248" rx="20" fill="#3a3a3a"/>
+    <text x="120" y="36" text-anchor="middle" fill="#f4f4f4" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="600">本机归档</text>
+    <text x="120" y="62" text-anchor="middle" fill="#c8c8c8" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="13">文档\Weekcase</text>
+    <g fill="none" stroke="#f4f4f4" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M72 168h96"/>
+      <path d="M88 128h28v40"/>
+      <path d="M148 128h28v40"/>
+      <rect x="80" y="112" width="44" height="16" rx="3"/>
+      <rect x="140" y="112" width="44" height="16" rx="3"/>
+      <rect x="64" y="168" width="112" height="36" rx="8"/>
+    </g>
+    <text x="120" y="230" text-anchor="middle" fill="#d8d8d8" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="13">只移动，不删除</text>
+  </g>
+</svg>

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="420" viewBox="0 0 640 420" role="img" aria-label="默认归档目录结构">
+  <title>归档长什么样</title>
+  <rect width="640" height="420" rx="28" fill="#2f2f2f"/>
+  <text x="40" y="48" fill="#f4f4f4" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="18" font-weight="600">文档\Weekcase</text>
+  <g fill="none" stroke="#f4f4f4" stroke-width="3" stroke-linecap="round">
+    <path d="M56 72v170"/>
+    <path d="M56 120h28"/>
+    <path d="M56 236h28"/>
+  </g>
+  <g font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" fill="#f4f4f4">
+    <text x="100" y="126" font-size="16" font-weight="600">Downloads</text>
+    <text x="124" y="156" font-size="14" fill="#d0d0d0">Images</text>
+    <text x="124" y="178" font-size="14" fill="#d0d0d0">Documents · Archives · Audio</text>
+    <text x="124" y="200" font-size="14" fill="#d0d0d0">Video · Installers · Other</text>
+    <text x="100" y="242" font-size="16" font-weight="600">Screenshots</text>
+    <text x="124" y="272" font-size="14" fill="#d0d0d0">2026-08</text>
+    <text x="124" y="294" font-size="14" fill="#d0d0d0">2026-09</text>
+  </g>
+  <text x="40" y="384" fill="#bdbdbd" font-family="Segoe UI, PingFang SC, Noto Sans SC, Microsoft YaHei, sans-serif" font-size="13">同名变成 foo-1.pdf，永不覆盖。搬错可以撤销上一次。</text>
+</svg>
